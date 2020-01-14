@@ -2597,7 +2597,7 @@ int reactor::run() {
     // I/O Performance greatly increases if the smp poller runs before the I/O poller. This is
     // because requests that were just added can be polled and processed by the I/O poller right
     // away.
-    if (smp::count > 1) {
+    if (smp::count >= 1) {
         smp_poller = poller(std::make_unique<smp_pollfn>(*this));
     }
 #ifndef HAVE_OSV
