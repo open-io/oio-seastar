@@ -41,7 +41,7 @@ public:
 
     future<> run();
     ud_server_client(ud_server_client&&) = default;
-    ud_server_client(const ud_server_client&) = default;
+    ud_server_client(const ud_server_client&) = delete;
 
 private:
     const string test_message{"are you still the same?"s};
@@ -79,14 +79,14 @@ future<> ud_server_client::init_server() {
                     BOOST_REQUIRE_EQUAL(cn_addr, socket_address{unix_domain_addr{*client_path}});
                 }
 
-                return do_with(std::move(cn.input()), std::move(cn.output()), [](auto& inp, auto& out) {
+                return do_with(cn.input(), cn.output(), [](auto& inp, auto& out) {
 
                     return inp.read().then([&out](auto bb) {
                         string ans = "-"s;
                         if (bb && bb.size()) {
                             ans = "+"s + string{bb.get(), bb.size()};
                         }
-                        return out.write(ans).then([&out](){out.flush();}).
+                        return out.write(ans).then([&out](){(void)out.flush();}).
                         then([&out](){return out.close();});
                     }).then([&inp]() { return inp.close(); }).
                     then([]() { return make_ready_future<>(); });
@@ -100,20 +100,20 @@ future<> ud_server_client::init_server() {
 /// Send a message to the server, and expect (almost) the same string back.
 /// If 'client_path' is set, the client binds to the named path.
 future<> ud_server_client::client_round() {
-    auto cc = client_path ? 
+    auto cc = client_path ?
         engine().net().connect(server_addr, socket_address{unix_domain_addr{*client_path}}).get0() :
         engine().net().connect(server_addr).get0();
 
-    return do_with(std::move(cc.input()), std::move(cc.output()), [this](auto& inp, auto& out) {
+    return do_with(cc.input(), cc.output(), [this](auto& inp, auto& out) {
 
         return out.write(test_message).then(
-            [this,&out,&inp](){ return out.flush(); }).then(
-            [this,&out,&inp](){ return inp.read(); }).then(
-            [this,&out,&inp](auto bb){
+            [&out](){ return out.flush(); }).then(
+            [&inp](){ return inp.read(); }).then(
+            [this, &inp](auto bb){
                 BOOST_REQUIRE_EQUAL(compat::string_view(bb.begin(), bb.size()), "+"s+test_message);
                 return inp.close();
             }).then([&out](){return out.close();}).then(
-            [&out,&inp]{ return make_ready_future<>(); });
+            []{ return make_ready_future<>(); });
     });
 
 }

@@ -233,7 +233,7 @@ public:
 
     template<typename Func>
     future<> register_handler(MsgType t, scheduling_group sg, Func func) {
-        return _service.invoke_on_all([this, t, func = std::move(func), sg] (rpc_test_service& s) mutable {
+        return _service.invoke_on_all([t, func = std::move(func), sg] (rpc_test_service& s) mutable {
             s.register_handler(t, sg, std::move(func));
         });
     }
@@ -244,7 +244,7 @@ public:
     }
 
     future<> unregister_handler(MsgType t) {
-        return _service.invoke_on_all([this, t] (rpc_test_service& s) mutable {
+        return _service.invoke_on_all([t] (rpc_test_service& s) mutable {
             return s.unregister_handler(t);
         });
     }
