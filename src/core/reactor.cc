@@ -3363,6 +3363,9 @@ void smp::allocate_reactor(unsigned id, reactor_backend_selector rbs, reactor_co
 void smp::cleanup() {
     smp::_threads = std::vector<posix_thread>();
     _thread_loops.clear();
+    reactor_holder.reset();
+    local_engine = nullptr;
+    smp::_qs.reset();
 }
 
 void smp::cleanup_cpu() {
