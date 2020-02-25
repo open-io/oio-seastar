@@ -82,7 +82,7 @@ ht = '\t';
 sp_ht = sp | ht;
 
 http_version = 'HTTP/' (digit '.' digit) >mark %store_version;
-http_return_code = digit digit digit >mark %store_return_code;
+http_return_code = (digit digit digit) >mark %store_return_code;
 
 field = tchar+ >mark %store_field_name;
 value = any* >mark %store_value;
