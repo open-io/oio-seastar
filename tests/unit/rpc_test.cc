@@ -32,6 +32,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/log.hh>
 
 using namespace seastar;
 
@@ -84,8 +85,8 @@ inline void write(serializer, Output& out, const sstring& v) {
 template <typename Input>
 inline sstring read(serializer, Input& in, rpc::type<sstring>) {
     auto size = read_arithmetic_type<uint32_t>(in);
-    sstring ret(sstring::initialized_later(), size);
-    in.read(ret.begin(), size);
+    sstring ret = uninitialized_string(size);
+    in.read(ret.data(), size);
     return ret;
 }
 
@@ -175,12 +176,12 @@ class rpc_test_env {
 
     rpc_test_config _cfg;
     loopback_connection_factory _lcf;
-    sharded<rpc_test_service> _service;
+    std::unique_ptr<sharded<rpc_test_service>> _service;
 
 public:
     rpc_test_env() = delete;
     explicit rpc_test_env(rpc_test_config cfg)
-        : _cfg(cfg)
+        : _cfg(cfg), _service(std::make_unique<sharded<rpc_test_service>>())
     {
     }
 
@@ -233,7 +234,7 @@ public:
 
     template<typename Func>
     future<> register_handler(MsgType t, scheduling_group sg, Func func) {
-        return _service.invoke_on_all([t, func = std::move(func), sg] (rpc_test_service& s) mutable {
+        return _service->invoke_on_all([t, func = std::move(func), sg] (rpc_test_service& s) mutable {
             s.register_handler(t, sg, std::move(func));
         });
     }
@@ -244,22 +245,23 @@ public:
     }
 
     future<> unregister_handler(MsgType t) {
-        return _service.invoke_on_all([t] (rpc_test_service& s) mutable {
+        return _service->invoke_on_all([t] (rpc_test_service& s) mutable {
             return s.unregister_handler(t);
         });
     }
 
 private:
     rpc_test_service& local_service() {
-        return _service.local();
+        return _service->local();
+
     }
 
     future<> start() {
-        return _service.start(std::cref(_cfg), std::ref(_lcf));
+        return _service->start(std::cref(_cfg), std::ref(_lcf));
     }
 
     future<> stop() {
-        return _service.stop().then([this] {
+        return _service->stop().then([this] {
             return _lcf.destroy_all_shards();
         });
     }
@@ -404,7 +406,7 @@ SEASTAR_TEST_CASE(test_message_to_big) {
         }).get();
         auto call = env.proto().make_client<void (sstring)>(1);
         try {
-            call(c, sstring(sstring::initialized_later(), 101)).get();
+            call(c, uninitialized_string(101)).get();
             good = false;
         } catch(std::runtime_error& err) {
         } catch(...) {
@@ -438,9 +440,12 @@ future<stream_test_result> stream_test_func(rpc_test_env<>& env, bool stop_clien
                     sink("seastar").get();
                     sleep(std::chrono::milliseconds(1)).get();
                 }
-                sink.flush().get();
-                sink.close().get();
-            });
+            }).finally([sink] () mutable {
+                return sink.flush();
+            }).finally([sink] () mutable {
+                return sink.close();
+            }).finally([sink] {});
+
             auto source_loop = seastar::async([source, &r] () mutable {
                 while (!r.server_source_closed) {
                     auto data = source().get0();
@@ -1120,9 +1125,35 @@ SEASTAR_TEST_CASE(test_unregister_handler) {
     });
 }
 
+SEASTAR_TEST_CASE(test_loggers) {
+    static seastar::logger log("dummy");
+    log.set_level(log_level::debug);
+    return rpc_test_env<>::do_with_thread(rpc_test_config(), [] (rpc_test_env<>& env, test_rpc_proto::client& c1) {
+        socket_address dummy_addr;
+        auto& proto = env.proto();
+        auto& logger = proto.get_logger();
+        logger(dummy_addr, "Hello0");
+        logger(dummy_addr, log_level::debug, "Hello1");
+        proto.set_logger(&log);
+        logger(dummy_addr, "Hello2");
+        logger(dummy_addr, log_level::debug, "Hello3");
+        // We *want* to test the deprecated API, don't spam warnings about it.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+        proto.set_logger([] (const sstring& str) {
+            log.info("Test: {}", str);
+        });
+#pragma GCC diagnostic pop
+        logger(dummy_addr, "Hello4");
+        logger(dummy_addr, log_level::debug, "Hello5");
+        proto.set_logger(nullptr);
+        logger(dummy_addr, "Hello6");
+        logger(dummy_addr, log_level::debug, "Hello7");
+    });
+}
+
 #if __cplusplus >= 201703
 
 static_assert(std::is_same_v<decltype(rpc::tuple(1U, 1L)), rpc::tuple<unsigned, long>>, "rpc::tuple deduction guid not working");
 
 #endif
-

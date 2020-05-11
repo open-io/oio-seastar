@@ -131,7 +131,9 @@ private:
         size_t nr;
         entry(promise<>&& pr_, size_t nr_) : pr(std::move(pr_)), nr(nr_) {}
     };
-    struct expiry_handler : private exception_factory {
+    struct expiry_handler : public exception_factory {
+        expiry_handler() = default;
+        expiry_handler(exception_factory&& f) : exception_factory(std::move(f)) { }
         void operator()(entry& e) noexcept {
             e.pr.set_exception(exception_factory::timeout());
         }
@@ -155,7 +157,7 @@ public:
     ///
     /// \param count number of initial units present in the counter.
     basic_semaphore(size_t count) : _count(count) {}
-    basic_semaphore(size_t count, exception_factory&& factory) : exception_factory(std::move(factory)), _count(count) {}
+    basic_semaphore(size_t count, exception_factory&& factory) : exception_factory(factory), _count(count), _wait_list(expiry_handler(std::move(factory))) {}
     /// Waits until at least a specific number of units are available in the
     /// counter, and reduces the counter by that amount of units.
     ///
@@ -166,7 +168,7 @@ public:
     /// \return a future that becomes ready when sufficient units are available
     ///         to satisfy the request.  If the semaphore was \ref broken(), may
     ///         contain an exception.
-    future<> wait(size_t nr = 1) {
+    future<> wait(size_t nr = 1) noexcept {
         return wait(time_point::max(), nr);
     }
     /// Waits until at least a specific number of units are available in the
@@ -182,7 +184,7 @@ public:
     ///         to satisfy the request.  On timeout, the future contains a
     ///         \ref semaphore_timed_out exception.  If the semaphore was
     ///         \ref broken(), may contain an exception.
-    future<> wait(time_point timeout, size_t nr = 1) {
+    future<> wait(time_point timeout, size_t nr = 1) noexcept {
         if (may_proceed(nr)) {
             _count -= nr;
             return make_ready_future<>();
@@ -192,7 +194,11 @@ public:
         }
         promise<> pr;
         auto fut = pr.get_future();
-        _wait_list.push_back(entry(std::move(pr), nr), timeout);
+        try {
+            _wait_list.push_back(entry(std::move(pr), nr), timeout);
+        } catch (...) {
+            pr.set_exception(std::current_exception());
+        }
         return fut;
     }
 
@@ -209,7 +215,7 @@ public:
     ///         to satisfy the request.  On timeout, the future contains a
     ///         \ref semaphore_timed_out exception.  If the semaphore was
     ///         \ref broken(), may contain an exception.
-    future<> wait(duration timeout, size_t nr = 1) {
+    future<> wait(duration timeout, size_t nr = 1) noexcept {
         return wait(clock::now() + timeout, nr);
     }
     /// Deposits a specified number of units into the counter.
@@ -367,6 +373,11 @@ public:
         assert(other._sem == _sem);
         _n += other.release();
     }
+
+    /// Returns the number of units held
+    size_t count() const noexcept {
+        return _n;
+    }
 };
 
 /// \brief Take units from semaphore temporarily
@@ -388,7 +399,7 @@ public:
 /// \related semaphore
 template<typename ExceptionFactory, typename Clock = typename timer<>::clock>
 future<semaphore_units<ExceptionFactory, Clock>>
-get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) {
+get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) noexcept {
     return sem.wait(units).then([&sem, units] {
         return semaphore_units<ExceptionFactory, Clock>{ sem, units };
     });
@@ -410,7 +421,7 @@ get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) {
 /// \related semaphore
 template<typename ExceptionFactory, typename Clock = typename timer<>::clock>
 future<semaphore_units<ExceptionFactory, Clock>>
-get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::time_point timeout) {
+get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::time_point timeout) noexcept {
     return sem.wait(timeout, units).then([&sem, units] {
         return semaphore_units<ExceptionFactory, Clock>{ sem, units };
     });
@@ -433,7 +444,7 @@ get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename 
 /// \related semaphore
 template<typename ExceptionFactory, typename Clock>
 future<semaphore_units<ExceptionFactory, Clock>>
-get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::duration timeout) {
+get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::duration timeout) noexcept {
     return sem.wait(timeout, units).then([&sem, units] {
         return semaphore_units<ExceptionFactory, Clock>{ sem, units };
     });
@@ -483,9 +494,9 @@ consume_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) {
 template <typename ExceptionFactory, typename Func, typename Clock = typename timer<>::clock>
 inline
 futurize_t<std::result_of_t<Func()>>
-with_semaphore(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, Func&& func) {
+with_semaphore(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, Func&& func) noexcept {
     return get_units(sem, units).then([func = std::forward<Func>(func)] (auto units) mutable {
-        return futurize_apply(std::forward<Func>(func)).finally([units = std::move(units)] {});
+        return futurize_invoke(std::forward<Func>(func)).finally([units = std::move(units)] {});
     });
 }
 
@@ -517,9 +528,9 @@ with_semaphore(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, Func
 template <typename ExceptionFactory, typename Clock, typename Func>
 inline
 futurize_t<std::result_of_t<Func()>>
-with_semaphore(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::duration timeout, Func&& func) {
+with_semaphore(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename basic_semaphore<ExceptionFactory, Clock>::duration timeout, Func&& func) noexcept {
     return get_units(sem, units, timeout).then([func = std::forward<Func>(func)] (auto units) mutable {
-        return futurize_apply(std::forward<Func>(func)).finally([units = std::move(units)] {});
+        return futurize_invoke(std::forward<Func>(func)).finally([units = std::move(units)] {});
     });
 }
 

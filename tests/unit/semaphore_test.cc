@@ -25,7 +25,6 @@
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
@@ -236,6 +235,7 @@ SEASTAR_THREAD_TEST_CASE(test_semaphore_units_splitting) {
     auto sm = semaphore(2);
     auto units = get_units(sm, 2, 1min).get0();
     {
+        BOOST_REQUIRE_EQUAL(units.count(), 2);
         BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
         auto split = units.split(1);
         BOOST_REQUIRE_EQUAL(sm.available_units(), 0);
@@ -266,4 +266,18 @@ SEASTAR_THREAD_TEST_CASE(test_named_semaphore_error) {
     sem->wait().then_wrapped(check_result).then([ret = std::move(ret)] () mutable {
         return std::move(ret);
     }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_named_semaphore_timeout) {
+    auto sem = make_lw_shared<named_semaphore>(0, named_semaphore_exception_factory{"name_of_the_semaphore"});
+
+    auto f = sem->wait(named_semaphore::clock::now() + 1ms, 1);
+    try {
+        f.get();
+        BOOST_FAIL("Expecting an exception");
+    } catch (named_semaphore_timed_out& ex) {
+        BOOST_REQUIRE_NE(std::string(ex.what()).find("name_of_the_semaphore"), std::string::npos);
+    } catch (...) {
+        BOOST_FAIL("Expected an instance of named_semaphore_timed_out with proper semaphore name");
+    }
 }

@@ -25,7 +25,26 @@
 #include <seastar/util/backtrace.hh>
 
 namespace seastar {
+
+// We can't test future_state_base directly because its private
+// destructor is protected.
+static_assert(std::is_nothrow_move_constructible<future_state<int>>::value,
+              "future_state's move constructor must not throw");
+
+static_assert(sizeof(future_state<>) <= 8, "future_state<> is too large");
+static_assert(sizeof(future_state<long>) <= 16, "future_state<long> is too large");
+
+// We need to be able to move and copy std::exception_ptr in and out
+// of future/promise/continuations without that producing a new
+// exception.
+static_assert(std::is_nothrow_copy_constructible<std::exception_ptr>::value,
+    "std::exception_ptr's copy constructor must not throw");
+static_assert(std::is_nothrow_move_constructible<std::exception_ptr>::value,
+    "std::exception_ptr's move constructor must not throw");
+
 namespace internal {
+
+static_assert(std::is_empty<uninitialized_wrapper<std::tuple<>>>::value, "This should still be empty");
 
 promise_base::promise_base(promise_base&& x) noexcept
     : _future(x._future), _state(x._state), _task(std::exchange(x._task, nullptr)) {
@@ -48,6 +67,10 @@ promise_base::~promise_base() noexcept {
     }
 }
 
+void promise_base::set_to_current_exception() noexcept {
+    set_exception(std::current_exception());
+}
+
 template <promise_base::urgent Urgent>
 void promise_base::make_ready() noexcept {
     if (_task) {
@@ -64,7 +87,7 @@ template void promise_base::make_ready<promise_base::urgent::no>() noexcept;
 template void promise_base::make_ready<promise_base::urgent::yes>() noexcept;
 
 template
-future<> current_exception_as_future() noexcept;
+future<> internal::current_exception_as_future() noexcept;
 }
 
 /**
@@ -83,7 +106,7 @@ void engine_exit(std::exception_ptr eptr) {
 
 broken_promise::broken_promise() : logic_error("broken promise") { }
 
-future_state_base future_state_base::current_exception() {
+future_state_base future_state_base::current_exception() noexcept {
     return future_state_base(std::current_exception());
 }
 
@@ -93,6 +116,21 @@ void future_state_base::set_to_broken_promise() noexcept {
         set_exception(std::make_exception_ptr(broken_promise{}));
     } catch (...) {
         set_exception(std::current_exception());
+    }
+}
+
+void future_state_base::ignore() noexcept {
+    switch (_u.st) {
+    case state::invalid:
+    case state::future:
+        assert(0 && "invalid state for ignore");
+    case state::result_unavailable:
+    case state::result:
+        _u.st = state::result_unavailable;
+        break;
+    default:
+        // Ignore the exception
+        _u.take_exception();
     }
 }
 

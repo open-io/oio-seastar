@@ -175,8 +175,8 @@ maybe_add_time_point(do_want_time_point, opt_time_point& otp, std::tuple<In...>&
 }
 
 inline sstring serialize_connection_id(const connection_id& id) {
-    sstring p(sstring::initialized_later(), sizeof(id));
-    auto c = p.begin();
+    sstring p = uninitialized_string(sizeof(id));
+    auto c = p.data();
     write_le(c, id.id);
     return p;
 }
@@ -301,8 +301,8 @@ struct unmarshal_one {
         }
     };
     static connection_id get_connection_id(Input& in) {
-        sstring id(sstring::initialized_later(), sizeof(connection_id));
-        in.read(id.begin(), sizeof(connection_id));
+        sstring id = uninitialized_string(sizeof(connection_id));
+        in.read(id.data(), sizeof(connection_id));
         return deserialize_connection_id(id);
     }
     template<typename... T> struct helper<sink<T...>> {
@@ -732,7 +732,8 @@ future<> sink_impl<Serializer, Out...>::operator()(const Out&... args) {
         if (this->_ex) {
             return make_exception_future(this->_ex);
         }
-        // FIXME: future is discarded
+        // It is OK to discard this future. The user is required to
+        // wait for it when closing.
         (void)smp::submit_to(this->_con->get_owner_shard(), [this, data = std::move(data)] () mutable {
             connection* con = this->_con->get();
             if (con->error()) {
@@ -785,6 +786,13 @@ future<> sink_impl<Serializer, Out...>::close() {
             return f.finally([con] { return con->close_sink(); });
         });
     });
+}
+
+template<typename Serializer, typename... Out>
+sink_impl<Serializer, Out...>::~sink_impl() {
+    // A failure to close might leave some continuations running after
+    // this is destroyed, leading to use-after-free bugs.
+    assert(this->_con->get()->sink_closed());
 }
 
 template<typename Serializer, typename... In>

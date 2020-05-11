@@ -26,7 +26,6 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/testing/test_runner.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/reactor.hh>
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future-util.hh>
@@ -38,15 +37,8 @@
 using namespace seastar;
 using namespace std::chrono_literals;
 
-fair_queue::config make_config(unsigned capacity) {
-    fair_queue::config cfg;
-    cfg.capacity = capacity;
-    cfg.max_req_count = capacity;
-    return cfg;
-}
-
 struct request {
-    fair_queue_request_descriptor fqdesc;
+    fair_queue_ticket fqdesc;
     unsigned index;
 
     request(unsigned weight, unsigned index)

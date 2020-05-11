@@ -27,6 +27,7 @@
 #endif
 
 #include <seastar/util/log.hh>
+#include <seastar/core/smp.hh>
 #include <seastar/util/log-cli.hh>
 
 #include <seastar/core/array_map.hh>
@@ -209,7 +210,7 @@ logger::really_do_log(log_level level, const char* fmt, const stringer* stringer
     };
     auto print_once = [&] (std::ostream& out) {
       if (local_engine) {
-        out << " [shard " << engine().cpu_id() << "] " << _name << " - ";
+        out << " [shard " << this_shard_id() << "] " << _name << " - ";
       } else {
         out << " " << _name << " - ";
       }
@@ -291,7 +292,7 @@ logger::set_syslog_enabled(bool enabled) {
 }
 
 bool logger::is_shard_zero() {
-    return engine().cpu_id() == 0;
+    return this_shard_id() == 0;
 }
 
 void
@@ -355,7 +356,8 @@ void apply_logging_settings(const logging_settings& s) {
         }
     }
 
-    switch (s.logger_ostream) {
+    logger_ostream_type logger_ostream = s.stdout_enabled ? s.logger_ostream : logger_ostream_type::none;
+    switch (logger_ostream) {
     case logger_ostream_type::none:
         logger::set_ostream_enabled(false);
         break;
@@ -424,13 +426,14 @@ bpo::options_description get_options_description() {
             ("logger-log-level",
              bpo::value<program_options::string_map>()->default_value({}),
              "Map of logger name to log level. The format is \"NAME0=LEVEL0[:NAME1=LEVEL1:...]\". "
-             "Valid logger names can be queried with --help-logging. "
+             "Valid logger names can be queried with --help-loggers. "
              "Valid values for levels are trace, debug, info, warn, error. "
              "This option can be specified multiple times."
             )
             ("logger-stdout-timestamps", bpo::value<logger_timestamp_style>()->default_value(logger_timestamp_style::real),
                     "Select timestamp style for stdout logs: none|boot|real")
-            ("log-to-stdout", bpo::value<logger_ostream_type>()->default_value(logger_ostream_type::stderr), "Send log output to: none|stdout|stderr")
+            ("log-to-stdout", bpo::value<bool>()->default_value(true), "Send log output to output stream, as selected by --logger-ostream-type")
+            ("logger-ostream-type", bpo::value<logger_ostream_type>()->default_value(logger_ostream_type::stderr), "Send log output to: none|stdout|stderr")
             ("log-to-syslog", bpo::value<bool>()->default_value(false), "Send log output to syslog.")
             ("help-loggers", bpo::bool_switch(), "Print a list of logger names and exit.");
 
@@ -458,9 +461,10 @@ logging_settings extract_settings(const boost::program_options::variables_map& v
     return logging_settings{
         std::move(levels),
         parse_log_level(vars["default-log-level"].as<sstring>()),
-        vars["log-to-stdout"].as<logger_ostream_type>(),
+        vars["log-to-stdout"].as<bool>(),
         vars["log-to-syslog"].as<bool>(),
-        vars["logger-stdout-timestamps"].as<logger_timestamp_style>()
+        vars["logger-stdout-timestamps"].as<logger_timestamp_style>(),
+        vars["logger-ostream-type"].as<logger_ostream_type>(),
     };
 }
 

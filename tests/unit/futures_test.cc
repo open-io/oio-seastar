@@ -21,15 +21,22 @@
 
 #include <seastar/testing/test_case.hh>
 
+#include <seastar/core/reactor.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/stream.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/manual_clock.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/print.hh>
+#include <seastar/util/log.hh>
 #include <boost/iterator/counting_iterator.hpp>
 #include <seastar/testing/thread_test_case.hh>
+
+#include <boost/range/iterator_range.hpp>
+#include <boost/range/irange.hpp>
 
 using namespace seastar;
 using namespace std::chrono_literals;
@@ -89,6 +96,22 @@ SEASTAR_TEST_CASE(test_stream) {
     return sub.done();
 }
 
+SEASTAR_TEST_CASE(test_stream_drop_sub) {
+    auto s = make_lw_shared<stream<int>>();
+    compat::optional<future<>> ret;
+    {
+        auto sub = s->listen([](int x) {
+            return make_ready_future<>();
+        });
+        ret = sub.done();
+        // It is ok to drop the subscription when we only want the competition future.
+    }
+    return s->produce(42).then([ret = std::move(*ret), s] () mutable {
+        s->close();
+        return std::move(ret);
+    });
+}
+
 SEASTAR_TEST_CASE(test_set_future_state_with_tuple) {
     future_state<int> s1;
     promise<int> p1;
@@ -105,7 +128,7 @@ SEASTAR_TEST_CASE(test_set_future_state_with_tuple) {
     return make_ready_future<>();
 }
 
-SEASTAR_TEST_CASE(test_set_value_throw_in_copy) {
+SEASTAR_THREAD_TEST_CASE(test_set_value_make_exception_in_copy) {
     struct throw_in_copy {
         throw_in_copy() noexcept = default;
         throw_in_copy(throw_in_copy&& x) noexcept {
@@ -116,8 +139,19 @@ SEASTAR_TEST_CASE(test_set_value_throw_in_copy) {
     };
     promise<throw_in_copy> p1;
     throw_in_copy v;
-    BOOST_REQUIRE_THROW(p1.set_value(v), int);
-    return make_ready_future<>();
+    p1.set_value(v);
+    BOOST_REQUIRE_THROW(p1.get_future().get(), int);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_set_exception_in_constructor) {
+    struct throw_in_constructor {
+        throw_in_constructor() {
+            throw 42;
+        }
+    };
+    future<throw_in_constructor> f = make_ready_future<throw_in_constructor>();
+    BOOST_REQUIRE(f.failed());
+    BOOST_REQUIRE_THROW(f.get(), int);
 }
 
 SEASTAR_TEST_CASE(test_finally_is_called_on_success_and_failure) {
@@ -609,8 +643,8 @@ SEASTAR_TEST_CASE(test_high_priority_task_runs_in_the_middle_of_loops) {
 }
 #endif
 
-SEASTAR_TEST_CASE(futurize_apply_val_exception) {
-    return futurize<int>::apply([] (int arg) { throw expected_exception(); return arg; }, 1).then_wrapped([] (future<int> f) {
+SEASTAR_TEST_CASE(futurize_invoke_val_exception) {
+    return futurize_invoke([] (int arg) { throw expected_exception(); return arg; }, 1).then_wrapped([] (future<int> f) {
         try {
             f.get();
             BOOST_FAIL("should have thrown");
@@ -618,8 +652,8 @@ SEASTAR_TEST_CASE(futurize_apply_val_exception) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_val_ok) {
-    return futurize<int>::apply([] (int arg) { return arg * 2; }, 2).then_wrapped([] (future<int> f) {
+SEASTAR_TEST_CASE(futurize_invoke_val_ok) {
+    return futurize_invoke([] (int arg) { return arg * 2; }, 2).then_wrapped([] (future<int> f) {
         try {
             auto x = f.get0();
             BOOST_REQUIRE_EQUAL(x, 4);
@@ -629,8 +663,8 @@ SEASTAR_TEST_CASE(futurize_apply_val_ok) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_val_future_exception) {
-    return futurize<int>::apply([] (int a) {
+SEASTAR_TEST_CASE(futurize_invoke_val_future_exception) {
+    return futurize_invoke([] (int a) {
         return sleep(std::chrono::milliseconds(100)).then([] {
             throw expected_exception();
             return make_ready_future<int>(0);
@@ -643,8 +677,8 @@ SEASTAR_TEST_CASE(futurize_apply_val_future_exception) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_val_future_ok) {
-    return futurize<int>::apply([] (int a) {
+SEASTAR_TEST_CASE(futurize_invoke_val_future_ok) {
+    return futurize_invoke([] (int a) {
         return sleep(std::chrono::milliseconds(100)).then([a] {
             return make_ready_future<int>(a * 100);
         });
@@ -657,8 +691,8 @@ SEASTAR_TEST_CASE(futurize_apply_val_future_ok) {
         }
     });
 }
-SEASTAR_TEST_CASE(futurize_apply_void_exception) {
-    return futurize<void>::apply([] (auto arg) { throw expected_exception(); }, 0).then_wrapped([] (future<> f) {
+SEASTAR_TEST_CASE(futurize_invoke_void_exception) {
+    return futurize_invoke([] (auto arg) { throw expected_exception(); }, 0).then_wrapped([] (future<> f) {
         try {
             f.get();
             BOOST_FAIL("should have thrown");
@@ -666,8 +700,8 @@ SEASTAR_TEST_CASE(futurize_apply_void_exception) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_void_ok) {
-    return futurize<void>::apply([] (auto arg) { }, 0).then_wrapped([] (future<> f) {
+SEASTAR_TEST_CASE(futurize_invoke_void_ok) {
+    return futurize_invoke([] (auto arg) { }, 0).then_wrapped([] (future<> f) {
         try {
             f.get();
         } catch (expected_exception& e) {
@@ -676,8 +710,8 @@ SEASTAR_TEST_CASE(futurize_apply_void_ok) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_void_future_exception) {
-    return futurize<void>::apply([] (auto a) {
+SEASTAR_TEST_CASE(futurize_invoke_void_future_exception) {
+    return futurize_invoke([] (auto a) {
         return sleep(std::chrono::milliseconds(100)).then([] {
             throw expected_exception();
         });
@@ -689,9 +723,9 @@ SEASTAR_TEST_CASE(futurize_apply_void_future_exception) {
     });
 }
 
-SEASTAR_TEST_CASE(futurize_apply_void_future_ok) {
+SEASTAR_TEST_CASE(futurize_invoke_void_future_ok) {
     auto a = make_lw_shared<int>(1);
-    return futurize<void>::apply([] (int& a) {
+    return futurize_invoke([] (int& a) {
         return sleep(std::chrono::milliseconds(100)).then([&a] {
             a *= 100;
         });
