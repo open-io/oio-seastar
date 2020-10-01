@@ -50,7 +50,6 @@
 #include <seastar/util/std-compat.hh>
 #include <boost/next_prior.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
-#include <boost/optional.hpp>
 #include <boost/program_options.hpp>
 #include <boost/thread/barrier.hpp>
 #include <boost/container/static_vector.hpp>
@@ -60,7 +59,6 @@
 #include <seastar/util/eclipse.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/posix.hh>
-#include <seastar/core/apply.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -83,6 +81,7 @@
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/internal/io_request.hh>
+#include <seastar/core/make_task.hh>
 #include "internal/pollable_fd.hh"
 #include "internal/poll.hh"
 
@@ -94,7 +93,6 @@
 #endif
 
 struct _Unwind_Exception;
-extern "C" int _Unwind_RaiseException(struct _Unwind_Exception *h);
 
 namespace seastar {
 
@@ -166,8 +164,8 @@ public:
         do_register();
     }
     ~poller();
-    poller(poller&& x);
-    poller& operator=(poller&& x);
+    poller(poller&& x) noexcept;
+    poller& operator=(poller&& x) noexcept;
     void do_register() noexcept;
     friend class reactor;
 };
@@ -177,6 +175,14 @@ public:
 class kernel_completion;
 class io_queue;
 class disk_config_params;
+
+class io_completion : public kernel_completion {
+public:
+    virtual void complete_with(ssize_t res) final override;
+
+    virtual void complete(size_t res) noexcept = 0;
+    virtual void set_exception(std::exception_ptr eptr) noexcept = 0;
+};
 
 class reactor {
     using sched_clock = std::chrono::steady_clock;
@@ -197,18 +203,7 @@ private:
     class io_queue_submission_pollfn;
     class syscall_pollfn;
     class execution_stage_pollfn;
-    friend signal_pollfn;
-    friend batch_flush_pollfn;
-    friend smp_pollfn;
-    friend drain_cross_cpu_freelist_pollfn;
-    friend lowres_timer_pollfn;
     friend class manual_clock;
-    friend class epoll_pollfn;
-    friend class reap_kernel_completions_pollfn;
-    friend class kernel_submit_work_pollfn;
-    friend class io_queue_submission_pollfn;
-    friend class syscall_pollfn;
-    friend class execution_stage_pollfn;
     friend class file_data_source_impl; // for fstream statistics
     friend class internal::reactor_stall_sampler;
     friend class preempt_io_context;
@@ -237,6 +232,8 @@ public:
         uint64_t fstream_read_aheads_discarded = 0;
         uint64_t fstream_read_ahead_discarded_bytes = 0;
     };
+    friend void io_completion::complete_with(ssize_t);
+
 private:
     reactor_config _cfg;
     file_desc _notify_eventfd;
@@ -264,7 +261,6 @@ private:
     // be stored here.
     std::vector<std::unique_ptr<io_queue>> my_io_queues;
     std::unordered_map<dev_t, io_queue*> _io_queues;
-    friend io_queue;
 
     std::vector<noncopyable_function<future<> ()>> _exit_funcs;
     unsigned _id = 0;
@@ -273,7 +269,7 @@ private:
     bool _finished_running_tasks = false;
     condition_variable _stop_requested;
     bool _handle_sigint = true;
-    compat::optional<future<std::unique_ptr<network_stack>>> _network_stack_ready;
+    std::optional<future<std::unique_ptr<network_stack>>> _network_stack_ready;
     int _return = 0;
     promise<> _start_promise;
     semaphore _cpu_started;
@@ -306,7 +302,7 @@ private:
         circular_buffer<task*> _q;
         sstring _name;
         int64_t to_vruntime(sched_clock::duration runtime) const;
-        void set_shares(float shares);
+        void set_shares(float shares) noexcept;
         struct indirect_compare;
         sched_clock::duration _time_spent_on_task_quota_violations = {};
         seastar::metrics::metric_groups _metrics;
@@ -323,6 +319,7 @@ private:
     task_queue_list _activating_task_queues;
     task_queue* _at_destroy_tasks;
     sched_clock::duration _task_quota;
+    task* _current_task = nullptr;
     /// Handler that will be called when there is no task to execute on cpu.
     /// It represents a low priority work.
     /// 
@@ -336,8 +333,8 @@ private:
     // _lowres_clock_impl will only be created on cpu 0
     std::unique_ptr<lowres_clock_impl> _lowres_clock_impl;
     lowres_clock::time_point _lowres_next_timeout;
-    compat::optional<poller> _epoll_poller;
-    compat::optional<pollable_fd> _aio_eventfd;
+    std::optional<poller> _epoll_poller;
+    std::optional<pollable_fd> _aio_eventfd;
     const bool _reuseport;
     circular_buffer<double> _loads;
     double _load = 0;
@@ -364,7 +361,6 @@ private:
     bool do_expire_lowres_timers();
     bool do_check_lowres_timers() const;
     void expire_manual_timers();
-    void abort_on_error(int ret);
     void start_aio_eventfd_loop();
     void stop_aio_eventfd_loop();
     template <typename T, typename E, typename EnableFunc>
@@ -408,6 +404,7 @@ private:
     signals _signals;
     std::unique_ptr<thread_pool> _thread_pool;
     friend class thread_pool;
+    friend class thread_context;
     friend class internal::cpu_stall_detector;
 
     uint64_t pending_task_count() const;
@@ -478,7 +475,7 @@ public:
     /// \param shares the new shares value
     /// \return a future that is ready when the share update is applied
     future<> update_shares_for_class(io_priority_class pc, uint32_t shares);
-    static future<> rename_priority_class(io_priority_class pc, sstring new_name);
+    static future<> rename_priority_class(io_priority_class pc, sstring new_name) noexcept;
 
     void configure(boost::program_options::variables_map config);
 
@@ -497,30 +494,30 @@ public:
 
     future<> write_all(pollable_fd_state& fd, const void* buffer, size_t size);
 
-    future<file> open_file_dma(sstring name, open_flags flags, file_open_options options = {}) noexcept;
-    future<file> open_directory(sstring name) noexcept;
-    future<> make_directory(sstring name, file_permissions permissions = file_permissions::default_dir_permissions) noexcept;
-    future<> touch_directory(sstring name, file_permissions permissions = file_permissions::default_dir_permissions) noexcept;
-    future<compat::optional<directory_entry_type>>  file_type(sstring name, follow_symlink = follow_symlink::yes) noexcept;
-    future<stat_data> file_stat(sstring pathname, follow_symlink) noexcept;
-    future<uint64_t> file_size(sstring pathname) noexcept;
-    future<bool> file_accessible(sstring pathname, access_flags flags) noexcept;
-    future<bool> file_exists(sstring pathname) noexcept {
+    future<file> open_file_dma(std::string_view name, open_flags flags, file_open_options options = {}) noexcept;
+    future<file> open_directory(std::string_view name) noexcept;
+    future<> make_directory(std::string_view name, file_permissions permissions = file_permissions::default_dir_permissions) noexcept;
+    future<> touch_directory(std::string_view name, file_permissions permissions = file_permissions::default_dir_permissions) noexcept;
+    future<std::optional<directory_entry_type>>  file_type(std::string_view name, follow_symlink = follow_symlink::yes) noexcept;
+    future<stat_data> file_stat(std::string_view pathname, follow_symlink) noexcept;
+    future<uint64_t> file_size(std::string_view pathname) noexcept;
+    future<bool> file_accessible(std::string_view pathname, access_flags flags) noexcept;
+    future<bool> file_exists(std::string_view pathname) noexcept {
         return file_accessible(pathname, access_flags::exists);
     }
-    future<fs_type> file_system_at(sstring pathname) noexcept;
-    future<struct statvfs> statvfs(sstring pathname) noexcept;
-    future<> remove_file(sstring pathname) noexcept;
-    future<> rename_file(sstring old_pathname, sstring new_pathname) noexcept;
-    future<> link_file(sstring oldpath, sstring newpath) noexcept;
-    future<> chmod(sstring name, file_permissions permissions) noexcept;
+    future<fs_type> file_system_at(std::string_view pathname) noexcept;
+    future<struct statvfs> statvfs(std::string_view pathname) noexcept;
+    future<> remove_file(std::string_view pathname) noexcept;
+    future<> rename_file(std::string_view old_pathname, std::string_view new_pathname) noexcept;
+    future<> link_file(std::string_view oldpath, std::string_view newpath) noexcept;
+    future<> chmod(std::string_view name, file_permissions permissions) noexcept;
 
-    future<int> inotify_add_watch(int fd, const sstring& path, uint32_t flags);
+    future<int> inotify_add_watch(int fd, std::string_view path, uint32_t flags);
     
     // In the following three methods, prepare_io is not guaranteed to execute in the same processor
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
-    void submit_io(kernel_completion* desc, internal::io_request req);
+    void submit_io(io_completion* desc, internal::io_request req) noexcept;
     future<size_t> submit_io_read(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,
@@ -529,13 +526,6 @@ public:
             const io_priority_class& priority_class,
             size_t len,
             internal::io_request req) noexcept;
-
-    inline void handle_io_result(ssize_t res) {
-        if (res < 0) {
-            ++_io_stats.aio_errors;
-            throw_kernel_error(res);
-        }
-    }
 
     int run();
     void exit(int ret);
@@ -557,6 +547,7 @@ public:
 #ifdef SEASTAR_SHUFFLE_TASK_QUEUE
     void shuffle(task*&, task_queue&);
 #endif
+    task* current_task() const { return _current_task; }
 
     void add_task(task* t) noexcept {
         auto sg = t->group();
@@ -634,13 +625,13 @@ private:
 
     void add_timer(timer<steady_clock_type>*);
     bool queue_timer(timer<steady_clock_type>*);
-    void del_timer(timer<steady_clock_type>*);
+    void del_timer(timer<steady_clock_type>*) noexcept;
     void add_timer(timer<lowres_clock>*);
     bool queue_timer(timer<lowres_clock>*);
-    void del_timer(timer<lowres_clock>*);
+    void del_timer(timer<lowres_clock>*) noexcept;
     void add_timer(timer<manual_clock>*);
     bool queue_timer(timer<manual_clock>*);
-    void del_timer(timer<manual_clock>*);
+    void del_timer(timer<manual_clock>*) noexcept;
 
     future<> run_exit_tasks();
     void stop();
@@ -659,27 +650,26 @@ private:
     friend class internal::poller;
     friend class scheduling_group;
     friend void add_to_flush_poller(output_stream<char>* os);
-    friend int ::_Unwind_RaiseException(struct _Unwind_Exception *h);
+    friend void seastar::log_exception_trace() noexcept;
     friend void report_failed_future(const std::exception_ptr& eptr) noexcept;
+    friend void with_allow_abandoned_failed_futures(unsigned count, noncopyable_function<void ()> func);
     metrics::metric_groups _metric_groups;
-    friend future<scheduling_group> create_scheduling_group(sstring name, float shares);
-    friend future<> seastar::destroy_scheduling_group(scheduling_group);
-    friend future<> seastar::rename_scheduling_group(scheduling_group sg, sstring new_name);
-    friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg);
+    friend future<scheduling_group> create_scheduling_group(sstring name, float shares) noexcept;
+    friend future<> seastar::destroy_scheduling_group(scheduling_group) noexcept;
+    friend future<> seastar::rename_scheduling_group(scheduling_group sg, sstring new_name) noexcept;
+    friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg) noexcept;
 
     template<typename T>
-    friend T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key);
-    template<typename T>
-    friend T& scheduling_group_get_specific(scheduling_group_key key);
+    friend T* internal::scheduling_group_get_specific_ptr(scheduling_group sg, scheduling_group_key key) noexcept;
     template<typename SpecificValType, typename Mapper, typename Reducer, typename Initial>
-        GCC6_CONCEPT( requires requires(SpecificValType specific_val, Mapper mapper, Reducer reducer, Initial initial) {
-            {reducer(initial, mapper(specific_val))} -> Initial;
+        SEASTAR_CONCEPT( requires requires(SpecificValType specific_val, Mapper mapper, Reducer reducer, Initial initial) {
+            {reducer(initial, mapper(specific_val))} -> std::convertible_to<Initial>;
         })
     friend future<typename function_traits<Reducer>::return_type>
     map_reduce_scheduling_group_specific(Mapper mapper, Reducer reducer, Initial initial_val, scheduling_group_key key);
     template<typename SpecificValType, typename Reducer, typename Initial>
-    GCC6_CONCEPT( requires requires(SpecificValType specific_val, Reducer reducer, Initial initial) {
-        {reducer(initial, specific_val)} -> Initial;
+    SEASTAR_CONCEPT( requires requires(SpecificValType specific_val, Reducer reducer, Initial initial) {
+        {reducer(initial, specific_val)} -> std::convertible_to<Initial>;
     })
     friend future<typename function_traits<Reducer>::return_type>
         reduce_scheduling_group_specific(Reducer reducer, Initial initial_val, scheduling_group_key key);
@@ -716,14 +706,11 @@ template <typename Func> // signature: bool ()
 inline
 std::unique_ptr<seastar::pollfn>
 internal::make_pollfn(Func&& func) {
-    struct the_pollfn : pollfn {
+    struct the_pollfn : simple_pollfn<false> {
         the_pollfn(Func&& func) : func(std::forward<Func>(func)) {}
         Func func;
         virtual bool poll() override final {
             return func();
-        }
-        virtual bool pure_poll() override final {
-            return poll(); // dubious, but compatible
         }
     };
     return std::make_unique<the_pollfn>(std::forward<Func>(func));

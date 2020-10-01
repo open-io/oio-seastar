@@ -26,7 +26,7 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/gate.hh>
@@ -42,8 +42,9 @@
 #include "loopback_socket.hh"
 #include "tmpdir.hh"
 
-#if 0
 #include <gnutls/gnutls.h>
+
+#if 0
 
 static void enable_gnutls_logging() {
     gnutls_global_set_log_level(99);
@@ -313,10 +314,12 @@ class echoserver {
     size_t _size;
     std::exception_ptr _ex;
 public:
-    echoserver(size_t message_size)
+    echoserver(size_t message_size, bool use_dh_params = true)
             : _certs(
-                    ::make_shared<tls::server_credentials>(
-                            ::make_shared<tls::dh_params>()))
+                    use_dh_params 
+                        ? ::make_shared<tls::server_credentials>(::make_shared<tls::dh_params>())
+                        : ::make_shared<tls::server_credentials>()
+                    )
             , _size(message_size)
     {}
 
@@ -334,7 +337,7 @@ public:
 
             _socket = tls::listen(_certs, addr, opts);
 
-            (void)with_gate(_gate, [this] {
+            (void)try_with_gate(_gate, [this] {
                 return _socket.accept().then([this](accept_result ar) {
                     ::connected_socket s = std::move(ar.connection);
                     auto strms = ::make_lw_shared<streams>(std::move(s));
@@ -360,7 +363,7 @@ public:
                     _ex = ep;
                     return make_ready_future<>();
                 });
-            });
+            }).handle_exception_type([] (const gate_closed_exception&) {/* ignore */});
             return make_ready_future<>();
         });
     }
@@ -385,7 +388,9 @@ static future<> run_echo_test(sstring message,
                 tls::client_auth ca = tls::client_auth::NONE,
                 sstring client_crt = {},
                 sstring client_key = {},
-                bool do_read = true
+                bool do_read = true,
+                bool use_dh_params = true,
+                tls::dn_callback distinguished_name_callback = {}
 )
 {
     static const auto port = 4711;
@@ -401,12 +406,15 @@ static future<> run_echo_test(sstring message,
 
     if (!client_crt.empty() && !client_key.empty()) {
         f = certs->set_x509_key_file(client_crt, client_key, tls::x509_crt_format::PEM);
+        if (distinguished_name_callback) {
+            certs->set_dn_verification_callback(std::move(distinguished_name_callback));
+        }
     }
 
     return f.then([=] {
         return certs->set_x509_trust_file(trust, tls::x509_crt_format::PEM);
     }).then([=] {
-        return server->start(msg->size()).then([=]() {
+        return server->start(msg->size(), use_dh_params).then([=]() {
             sstring server_trust;
             if (ca != tls::client_auth::NONE) {
                 server_trust = trust;
@@ -471,10 +479,19 @@ SEASTAR_TEST_CASE(test_simple_x509_client_server) {
     return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org");
 }
 
-
 SEASTAR_TEST_CASE(test_simple_x509_client_server_again) {
     return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org");
 }
+
+#if GNUTLS_VERSION_NUMBER >= 0x030600
+// Test #769 - do not set dh_params in server certs - let gnutls negotiate.
+SEASTAR_TEST_CASE(test_simple_server_default_dhparams) {
+    return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org",
+        "tests/unit/test.crt", "tests/unit/test.key", tls::client_auth::NONE,
+        {}, {}, true, /* use_dh_params */ false
+    );
+}
+#endif
 
 SEASTAR_TEST_CASE(test_x509_client_server_cert_validation_fail) {
     // Load a real trust authority here, which out certs are _not_ signed with.
@@ -538,6 +555,28 @@ SEASTAR_TEST_CASE(test_simple_x509_client_server_client_auth) {
     // server name
     // Server will require certificate auth. We supply one, so should succeed with connection
     return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org", "tests/unit/test.crt", "tests/unit/test.key", tls::client_auth::REQUIRE, "tests/unit/test.crt", "tests/unit/test.key");
+}
+
+SEASTAR_TEST_CASE(test_simple_x509_client_server_client_auth_with_dn_callback) {
+    // In addition to the above test, the certificate's subject and issuer
+    // Distinguished Names (DNs) will be checked for the occurrence of a specific
+    // substring (in this case, the test.scylladb.org url)
+    return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org", "tests/unit/test.crt", "tests/unit/test.key", tls::client_auth::REQUIRE, "tests/unit/test.crt", "tests/unit/test.key", true, true, [](tls::session_type t, sstring subject, sstring issuer) {
+        BOOST_REQUIRE(t == tls::session_type::CLIENT);
+        BOOST_REQUIRE(subject.find("test.scylladb.org") != sstring::npos);
+        BOOST_REQUIRE(issuer.find("test.scylladb.org") != sstring::npos);
+    });
+}
+
+SEASTAR_TEST_CASE(test_simple_x509_client_server_client_auth_dn_callback_fails) {
+    // Test throwing an exception from within the Distinguished Names callback
+    return run_echo_test(message, 20, "tests/unit/catest.pem", "test.scylladb.org", "tests/unit/test.crt", "tests/unit/test.key", tls::client_auth::REQUIRE, "tests/unit/test.crt", "tests/unit/test.key", true, true, [](tls::session_type, sstring, sstring) {
+        throw tls::verification_error("to test throwing from within the callback");
+    }).then([] {
+        BOOST_FAIL("Should have gotten a verification_error exception");
+    }).handle_exception([](auto) {
+        // ok.
+    });
 }
 
 SEASTAR_TEST_CASE(test_many_large_message_x509_client_server) {
@@ -647,7 +686,7 @@ SEASTAR_THREAD_TEST_CASE(test_close_timout) {
 SEASTAR_THREAD_TEST_CASE(test_reload_certificates) {
     tmpdir tmp;
 
-    namespace fs = compat::filesystem;
+    namespace fs = std::filesystem;
 
     // copy the wrong certs. We don't trust these
     // blocking calls, but this is a test and seastar does not have a copy 
@@ -749,4 +788,50 @@ SEASTAR_THREAD_TEST_CASE(test_reload_certificates) {
 
         BOOST_CHECK_EQUAL(sstring(buf.begin(), buf.end()), "apa");
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_reload_broken_certificates) {
+    tmpdir tmp;
+
+    namespace fs = std::filesystem;
+
+    fs::copy_file("tests/unit/test.crt", tmp.path() / "test.crt");
+    fs::copy_file("tests/unit/test.key", tmp.path() / "test.key");
+
+    auto cert = (tmp.path() / "test.crt").native();
+    auto key = (tmp.path() / "test.key").native();
+    std::unordered_set<sstring> changed;
+    promise<> p;
+
+    tls::credentials_builder b;
+    b.set_x509_key_file(cert, key, tls::x509_crt_format::PEM).get();
+    b.set_dh_level();
+
+    queue<std::exception_ptr> q(10);
+
+    auto certs = b.build_reloadable_server_credentials([&](const std::unordered_set<sstring>& files, std::exception_ptr ep) {
+        if (ep) {
+            q.push(std::move(ep));
+            return;
+        }
+        changed.insert(files.begin(), files.end());
+        if (changed.count(cert) && changed.count(key)) {
+            p.set_value();
+        }
+    }).get0();
+
+    // very intentionally use blocking calls. We want all our modifications to happen
+    // before any other continuation is allowed to process.
+
+    fs::remove(cert);
+    fs::remove(key);
+
+    // should get one or two exceptions
+    q.pop_eventually().get();
+
+    fs::copy_file("tests/unit/test.crt", cert);
+    fs::copy_file("tests/unit/test.key", key);
+
+    // now it should reload
+    p.get_future().get();
 }

@@ -35,8 +35,8 @@ template <typename T>
 class queue {
     std::queue<T, circular_buffer<T>> _q;
     size_t _max;
-    compat::optional<promise<>> _not_empty;
-    compat::optional<promise<>> _not_full;
+    std::optional<promise<>> _not_empty;
+    std::optional<promise<>> _not_full;
     std::exception_ptr _ex = nullptr;
 private:
     void notify_not_empty();
@@ -54,7 +54,7 @@ public:
     /// Popping from an empty queue will result in undefined behavior.
     T pop();
 
-    /// Consumes items from the queue, passing them to @func, until @func
+    /// Consumes items from the queue, passing them to \c func, until \c func
     /// returns false or the queue it empty
     ///
     /// Returns false if func returned false.
@@ -117,11 +117,11 @@ public:
         _ex = ex;
         if (_not_full) {
             _not_full->set_exception(ex);
-            _not_full= compat::nullopt;
+            _not_full= std::nullopt;
         }
         if (_not_empty) {
             _not_empty->set_exception(std::move(ex));
-            _not_empty = compat::nullopt;
+            _not_empty = std::nullopt;
         }
     }
 
@@ -144,7 +144,7 @@ inline
 void queue<T>::notify_not_empty() {
     if (_not_empty) {
         _not_empty->set_value();
-        _not_empty = compat::optional<promise<>>();
+        _not_empty = std::optional<promise<>>();
     }
 }
 
@@ -153,7 +153,7 @@ inline
 void queue<T>::notify_not_full() {
     if (_not_full) {
         _not_full->set_value();
-        _not_full = compat::optional<promise<>>();
+        _not_full = std::optional<promise<>>();
     }
 }
 

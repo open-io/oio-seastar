@@ -74,7 +74,7 @@ static constexpr size_t huge_page_size =
 #endif
 
 void configure(std::vector<resource::memory> m, bool mbind,
-        compat::optional<std::string> hugetlbfs_path = {});
+        std::optional<std::string> hugetlbfs_path = {});
 
 void enable_abort_on_allocation_failure();
 
@@ -82,6 +82,16 @@ class disable_abort_on_alloc_failure_temporarily {
 public:
     disable_abort_on_alloc_failure_temporarily();
     ~disable_abort_on_alloc_failure_temporarily() noexcept;
+};
+
+// Disables heap profiling as long as this object is alive.
+// Can be nested, in which case the profiling is re-enabled when all
+// the objects go out of scope.
+class disable_backtrace_temporarily {
+    bool _old;
+public:
+    disable_backtrace_temporarily();
+    ~disable_backtrace_temporarily();
 };
 
 enum class reclaiming_result {
@@ -130,7 +140,7 @@ public:
     reclaimer_scope scope() const { return _scope; }
 };
 
-extern compat::polymorphic_allocator<char>* malloc_allocator;
+extern std::pmr::polymorphic_allocator<char>* malloc_allocator;
 
 // Call periodically to recycle objects that were freed
 // on cpu other than the one they were allocated on.

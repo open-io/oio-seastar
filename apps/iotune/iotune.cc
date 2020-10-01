@@ -47,6 +47,7 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fsqual.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/std-compat.hh>
@@ -54,7 +55,7 @@
 
 using namespace seastar;
 using namespace std::chrono_literals;
-namespace fs = seastar::compat::filesystem;
+namespace fs = std::filesystem;
 
 logger iotune_logger("iotune");
 
@@ -285,6 +286,7 @@ public:
 
 class io_worker {
     uint64_t _bytes = 0;
+    uint64_t _max_offset = 0;
     unsigned _requests = 0;
     size_t _buffer_size;
     std::chrono::time_point<iotune_clock, std::chrono::duration<double>> _start_measuring;
@@ -319,8 +321,10 @@ public:
     }
 
     future<> issue_request(char* buf) {
-        return _req_impl->issue_request(_pos_impl->get_pos(), buf, _buffer_size).then([this] (size_t size) {
+        uint64_t pos = _pos_impl->get_pos();
+        return _req_impl->issue_request(pos, buf, _buffer_size).then([this, pos] (size_t size) {
             auto now = iotune_clock::now();
+            _max_offset = std::max(_max_offset, pos + size);
             if ((now > _start_measuring) && (now < _end_measuring)) {
                 _last_time_seen = now;
                 _bytes += size;
@@ -329,9 +333,7 @@ public:
         });
     }
 
-    uint64_t bytes() const {
-        return _bytes;
-    }
+    uint64_t max_offset() const noexcept { return _max_offset; }
 
     io_rates get_io_rates() const {
         io_rates rates;
@@ -407,7 +409,7 @@ public:
             }
 
             if (update_file_size) {
-                _file_size = worker->bytes();
+                _file_size = worker->max_offset();
             }
             return make_ready_future<io_rates>(worker->get_io_rates());
         });
@@ -541,7 +543,7 @@ void write_property_file(sstring conf_file, std::vector<disk_descriptor> disk_de
 // (absolute, with symlinks resolved), until we find a point that crosses a device ID.
 fs::path mountpoint_of(sstring filename) {
     fs::path mnt_candidate = fs::canonical(fs::path(filename));
-    compat::optional<dev_t> candidate_id = {};
+    std::optional<dev_t> candidate_id = {};
     auto current = mnt_candidate;
     do {
         auto f = open_directory(current.string()).get0();

@@ -24,7 +24,6 @@
 #include <seastar/core/sstring.hh>
 #include <seastar/core/fair_queue.hh>
 #include <seastar/core/metrics_registration.hh>
-#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/internal/io_request.hh>
 #include <mutex>
@@ -36,7 +35,7 @@ class io_priority_class;
 
 /// Renames an io priority class
 ///
-/// Renames an \ref io_priority_class previously created with register_one_priority_class().
+/// Renames an `io_priority_class` previously created with register_one_priority_class().
 ///
 /// The operation is global and affects all shards.
 /// The operation affects the exported statistics labels.
@@ -75,7 +74,7 @@ private:
         void register_stats(sstring name, sstring mountpoint, shard_id owner);
     };
 
-    std::vector<std::vector<lw_shared_ptr<priority_class_data>>> _priority_classes;
+    std::vector<std::vector<std::unique_ptr<priority_class_data>>> _priority_classes;
     fair_queue _fq;
 
     static constexpr unsigned _max_classes = 2048;
@@ -83,11 +82,14 @@ private:
     static std::array<uint32_t, _max_classes> _registered_shares;
     static std::array<sstring, _max_classes> _registered_names;
 
+public:
     static io_priority_class register_one_priority_class(sstring name, uint32_t shares);
+    static bool rename_one_priority_class(io_priority_class pc, sstring name);
 
+private:
     priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
-    friend class smp;
-    fair_queue_ticket _completed_accumulator = { 0, 0 };
+
+    fair_queue_ticket request_fq_ticket(const internal::io_request& req, size_t len) const;
 
     // The fields below are going away, they are just here so we can implement deprecated
     // functions that used to be provided by the fair_queue and are going away (from both
@@ -107,8 +109,8 @@ public:
     static constexpr unsigned read_request_base_count = 128;
 
     struct config {
+        dev_t devid;
         shard_id coordinator;
-        std::vector<shard_id> io_topology;
         unsigned capacity = std::numeric_limits<unsigned>::max();
         unsigned max_req_count = std::numeric_limits<unsigned>::max();
         unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
@@ -138,10 +140,7 @@ public:
         return _requests_executing;
     }
 
-    void notify_requests_finished(fair_queue_ticket& desc);
-
-    // Inform the underlying queue about the fact that some of our requests finished
-    void process_completions();
+    void notify_requests_finished(fair_queue_ticket& desc) noexcept;
 
     // Dispatch requests that are pending in the I/O queue
     void poll_io_queue() {
@@ -155,14 +154,14 @@ public:
     shard_id coordinator() const {
         return _config.coordinator;
     }
-    shard_id coordinator_of_shard(shard_id shard) const {
-        return _config.io_topology[shard];
+
+    dev_t dev_id() const noexcept {
+        return _config.devid;
     }
 
     future<> update_shares_for_class(io_priority_class pc, size_t new_shares);
     void rename_priority_class(io_priority_class pc, sstring new_name);
 
-    friend class reactor;
 private:
     config _config;
     static fair_queue::config make_fair_queue_config(config cfg);

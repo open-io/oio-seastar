@@ -91,8 +91,8 @@ disable_abort_on_alloc_failure_temporarily::~disable_abort_on_alloc_failure_temp
     --abort_on_alloc_failure_suppressed;
 }
 
-static compat::polymorphic_allocator<char> static_malloc_allocator{compat::pmr_get_default_resource()};;
-compat::polymorphic_allocator<char>* malloc_allocator{&static_malloc_allocator};
+static std::pmr::polymorphic_allocator<char> static_malloc_allocator{std::pmr::get_default_resource()};;
+std::pmr::polymorphic_allocator<char>* malloc_allocator{&static_malloc_allocator};
 
 }
 
@@ -182,7 +182,7 @@ static thread_local uint64_t g_cross_cpu_frees;
 static thread_local uint64_t g_reclaims;
 static thread_local uint64_t g_large_allocs;
 
-using compat::optional;
+using std::optional;
 
 using allocate_system_memory_fn
         = std::function<mmap_area (void* where, size_t how_much)>;
@@ -685,27 +685,14 @@ cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages) {
     return allocate_large_and_trim(n_pages);
 }
 
-#ifdef SEASTAR_HEAPPROF
+disable_backtrace_temporarily::disable_backtrace_temporarily() {
+    _old = cpu_mem.collect_backtrace;
+    cpu_mem.collect_backtrace = false;
+}
 
-class disable_backtrace_temporarily {
-    bool _old;
-public:
-    disable_backtrace_temporarily() {
-        _old = cpu_mem.collect_backtrace;
-        cpu_mem.collect_backtrace = false;
-    }
-    ~disable_backtrace_temporarily() {
-        cpu_mem.collect_backtrace = _old;
-    }
-};
-
-#else
-
-struct disable_backtrace_temporarily {
-    ~disable_backtrace_temporarily() {}
-};
-
-#endif
+disable_backtrace_temporarily::~disable_backtrace_temporarily() {
+    cpu_mem.collect_backtrace = _old;
+}
 
 static
 saved_backtrace get_backtrace() noexcept {
@@ -1256,6 +1243,10 @@ static inline cpu_pages& get_cpu_mem()
     return *cpu_mem_ptr;
 }
 
+#ifdef SEASTAR_DEBUG_ALLOCATIONS
+static constexpr int debug_allocation_pattern = 0xab;
+#endif
+
 void* allocate(size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
@@ -1269,6 +1260,10 @@ void* allocate(size_t size) {
     }
     if (!ptr) {
         on_allocation_failure(size);
+    } else {
+#ifdef SEASTAR_DEBUG_ALLOCATIONS
+        std::memset(ptr, debug_allocation_pattern, size);
+#endif
     }
     ++g_allocs;
     return ptr;
@@ -1289,6 +1284,10 @@ void* allocate_aligned(size_t align, size_t size) {
     }
     if (!ptr) {
         on_allocation_failure(size);
+    } else {
+#ifdef SEASTAR_DEBUG_ALLOCATIONS
+        std::memset(ptr, debug_allocation_pattern, size);
+#endif
     }
     ++g_allocs;
     return ptr;
@@ -1313,6 +1312,10 @@ void free(void* obj, size_t size) {
 void free_aligned(void* obj, size_t align, size_t size) {
     if (size <= sizeof(free_object)) {
         size = sizeof(free_object);
+    }
+    if (size <= max_small_allocation && align <= page_size) {
+        // Same adjustment as allocate_aligned()
+        size = 1 << log2ceil(object_size_with_alloc_site(size));
     }
     free(obj, size);
 }
@@ -1863,6 +1866,13 @@ namespace seastar {
 
 namespace memory {
 
+disable_backtrace_temporarily::disable_backtrace_temporarily() {
+    (void)_old;
+}
+
+disable_backtrace_temporarily::~disable_backtrace_temporarily() {
+}
+
 void set_heap_profiling_enabled(bool enabled) {
     seastar_logger.warn("Seastar compiled with default allocator, heap profiler not supported");
 }
@@ -1890,7 +1900,7 @@ reclaimer::~reclaimer() {
 void set_reclaim_hook(std::function<void (std::function<void ()>)> hook) {
 }
 
-void configure(std::vector<resource::memory> m, bool mbind, compat::optional<std::string> hugepages_path) {
+void configure(std::vector<resource::memory> m, bool mbind, std::optional<std::string> hugepages_path) {
 }
 
 statistics stats() {

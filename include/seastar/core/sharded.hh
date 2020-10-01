@@ -22,12 +22,17 @@
 #pragma once
 
 #include <seastar/core/smp.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/map_reduce.hh>
 #include <seastar/util/is_smart_ptr.hh>
 #include <seastar/util/tuple_utils.hh>
 #include <seastar/core/do_with.hh>
+#include <seastar/util/concepts.hh>
 #include <boost/iterator/counting_iterator.hpp>
 #include <functional>
+#if __has_include(<concepts>)
+#include <concepts>
+#endif
 
 /// \defgroup smp-module Multicore
 ///
@@ -40,6 +45,16 @@
 /// threaded programming.
 
 namespace seastar {
+
+template <typename Func, typename... Param>
+class sharded_parameter;
+
+namespace internal {
+
+template <typename Func, typename... Param>
+auto unwrap_sharded_arg(sharded_parameter<Func, Param...> sp);
+
+}
 
 /// \addtogroup smp-module
 /// @{
@@ -146,7 +161,7 @@ public:
     /// with a copy of \c args passed to the constructor.
     ///
     /// \param args Arguments to be forwarded to \c Service constructor
-    /// \return a \ref future<> that becomes ready when all instances have been
+    /// \return a \ref seastar::future<> that becomes ready when all instances have been
     ///         constructed.
     template <typename... Args>
     future<> start(Args&&... args);
@@ -155,7 +170,7 @@ public:
     /// with a copy of \c args passed to the constructor.
     ///
     /// \param args Arguments to be forwarded to \c Service constructor
-    /// \return a \ref future<> that becomes ready when the instance has been
+    /// \return a \ref seastar::future<> that becomes ready when the instance has been
     ///         constructed.
     template <typename... Args>
     future<> start_single(Args&&... args);
@@ -166,7 +181,7 @@ public:
     /// it is destroyed.
     future<> stop();
 
-    /// Invoke a type-erased function on all instances of @Service.
+    /// Invoke a type-erased function on all instances of `Service`.
     /// The return value becomes ready when all instances have processed
     /// the message.
     ///
@@ -176,7 +191,7 @@ public:
     /// \return Future that becomes ready once all calls have completed
     future<> invoke_on_all(smp_submit_to_options options, std::function<future<> (Service&)> func);
 
-    /// Invoke a type-erased function on all instances of @Service.
+    /// Invoke a type-erased function on all instances of `Service`.
     /// The return value becomes ready when all instances have processed
     /// the message.
     /// Passes the default \ref smp_submit_to_options to the
@@ -185,79 +200,33 @@ public:
         return invoke_on_all(smp_submit_to_options{}, std::move(func));
     }
 
-    /// Invoke a method on all instances of @Service.
+    /// Invoke a function on all instances of `Service`.
     /// The return value becomes ready when all instances have processed
-    /// the message.
+    /// the message. The function can be a member pointer to function,
+    /// a free function, or a functor. The first argument of the function
+    /// will be a reference to the local service on the shard.
+    ///
+    /// For a non-static pointer-to-member-function, the first argument
+    /// becomes `this`, not the first declared parameter.
     ///
     /// \param options the options to forward to the \ref smp::submit_to()
     ///         called behind the scenes.
-    /// \param func Member function of \c Service to be invoked on all shards
+    /// \param func invocable accepting a `Service&` as the first parameter
+    ///        to be invoked on all shards
     /// \return Future that becomes ready once all calls have completed
-    template <typename... Args>
-    future<> invoke_on_all(smp_submit_to_options options, future<> (Service::*func)(Args...), Args... args);
+    template <typename Func, typename... Args>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
+    future<> invoke_on_all(smp_submit_to_options options, Func func, Args... args);
 
-    /// Invoke a method on all instances of @Service.
+    /// Invoke a function on all instances of `Service`.
     /// The return value becomes ready when all instances have processed
     /// the message.
     /// Passes the default \ref smp_submit_to_options to the
     /// \ref smp::submit_to() called behind the scenes.
-    template <typename... Args>
-    future<> invoke_on_all(future<> (Service::*func)(Args...), Args... args) {
-        return invoke_on_all(smp_submit_to_options{}, func, std::move(args)...);
-    }
-
-    /// Invoke a method on all \c Service instances in parallel.
-    ///
-    /// \param options the options to forward to the \ref smp::submit_to()
-    ///         called behind the scenes.
-    /// \param func member function to be called.  Must return \c void or
-    ///             \c future<>.
-    /// \param args arguments to be passed to \c func.
-    /// \return future that becomes ready when the method has been invoked
-    ///         on all instances.
-    template <typename... Args>
-    future<> invoke_on_all(smp_submit_to_options options, void (Service::*func)(Args...), Args... args);
-
-    /// Invoke a method on all \c Service instances in parallel.
-    ///
-    /// \param func member function to be called.  Must return \c void or
-    ///             \c future<>.
-    /// \param args arguments to be passed to \c func.
-    /// \return future that becomes ready when the method has been invoked
-    ///         on all instances.
-    ///
-    /// Passes the default \ref smp_submit_to_options to the
-    /// \ref smp::submit_to() called behind the scenes.
-    template <typename... Args>
-    future<> invoke_on_all(void (Service::*func)(Args...), Args... args) {
-        return invoke_on_all(smp_submit_to_options{}, func, std::move(args)...);
-    }
-
-    /// Invoke a callable on all instances of  \c Service.
-    ///
-    /// \param options the options to forward to the \ref smp::submit_to()
-    ///         called behind the scenes.
-    /// \param func a callable with the signature `void (Service&)`
-    ///             or `future<> (Service&)`, to be called on each core
-    ///             with the local instance as an argument.
-    /// \return a `future<>` that becomes ready when all cores have
-    ///         processed the message.
-    template <typename Func>
-    future<> invoke_on_all(smp_submit_to_options options, Func&& func);
-
-    /// Invoke a callable on all instances of  \c Service.
-    ///
-    /// \param func a callable with the signature `void (Service&)`
-    ///             or `future<> (Service&)`, to be called on each core
-    ///             with the local instance as an argument.
-    /// \return a `future<>` that becomes ready when all cores have
-    ///         processed the message.
-    ///
-    /// Passes the default \ref smp_submit_to_options to the
-    /// \ref smp::submit_to() called behind the scenes.
-    template <typename Func>
-    future<> invoke_on_all(Func&& func) {
-        return invoke_on_all(smp_submit_to_options{}, std::forward<Func>(func));
+    template <typename Func, typename... Args>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
+    future<> invoke_on_all(Func func, Args... args) {
+        return invoke_on_all(smp_submit_to_options{}, std::move(func), std::move(args)...);
     }
 
     /// Invoke a callable on all instances of  \c Service except the instance
@@ -270,8 +239,9 @@ public:
     ///             with the local instance as an argument.
     /// \return a `future<>` that becomes ready when all cores but the current one have
     ///         processed the message.
-    template <typename Func>
-    future<> invoke_on_others(smp_submit_to_options options, Func&& func);
+    template <typename Func, typename... Args>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
+    future<> invoke_on_others(smp_submit_to_options options, Func func, Args... args);
 
     /// Invoke a callable on all instances of  \c Service except the instance
     /// which is allocated on current shard.
@@ -284,9 +254,10 @@ public:
     ///
     /// Passes the default \ref smp_submit_to_options to the
     /// \ref smp::submit_to() called behind the scenes.
-    template <typename Func>
-    future<> invoke_on_others(Func&& func) {
-        return invoke_on_others(smp_submit_to_options{}, std::forward<Func>(func));
+    template <typename Func, typename... Args>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
+    future<> invoke_on_others(Func func, Args... args) {
+        return invoke_on_others(smp_submit_to_options{}, std::move(func), std::move(args)...);
     }
 
     /// Invoke a method on all instances of `Service` and reduce the results using
@@ -303,7 +274,7 @@ public:
                             boost::make_counting_iterator<unsigned>(_instances.size()),
             [this, func, args = std::make_tuple(std::forward<Args>(args)...)] (unsigned c) mutable {
                 return smp::submit_to(c, [this, func, args] () mutable {
-                    return apply([this, func] (Args&&... args) mutable {
+                    return std::apply([this, func] (Args&&... args) mutable {
                         auto inst = _instances[this_shard_id()].service;
                         if (inst) {
                             return ((*inst).*func)(std::forward<Args>(args)...);
@@ -374,7 +345,7 @@ public:
     ///
     /// \tparam  Mapper unary function taking `Service&` and producing some result.
     /// \return  Result vector of invoking `map` with each instance in parallel
-    template <typename Mapper, typename Future = futurize_t<std::result_of_t<Mapper(Service&)>>, typename return_type = decltype(internal::untuple(std::declval<typename Future::value_type>()))>
+    template <typename Mapper, typename Future = futurize_t<std::result_of_t<Mapper(Service&)>>, typename return_type = decltype(internal::untuple(std::declval<typename Future::tuple_type>()))>
     inline future<std::vector<return_type>> map(Mapper mapper) {
         return do_with(std::vector<return_type>(),
                 [&mapper, this] (std::vector<return_type>& vec) mutable {
@@ -392,49 +363,25 @@ public:
         });
     }
 
-    /// Invoke a method on a specific instance of `Service`.
-    ///
-    /// \param id shard id to call
-    /// \param options the options to forward to the \ref smp::submit_to()
-    ///         called behind the scenes.
-    /// \param func a method of `Service`
-    /// \param args arguments to be passed to `func`
-    /// \return result of calling `func(args)` on the designated instance
-    template <typename Ret, typename... FuncArgs, typename... Args, typename FutureRet = futurize_t<Ret>>
-    FutureRet
-    invoke_on(unsigned id, smp_submit_to_options options, Ret (Service::*func)(FuncArgs...), Args&&... args) {
-        return smp::submit_to(id, options, [this, func, args = std::make_tuple(std::forward<Args>(args)...)] () mutable {
-            auto inst = get_local_service();
-            return futurize_apply(std::mem_fn(func), std::tuple_cat(std::make_tuple<>(inst), std::move(args)));
-        });
-    }
-
-    /// Invoke a method on a specific instance of `Service`.
-    ///
-    /// \param id shard id to call
-    /// \param func a method of `Service`
-    /// \param args arguments to be passed to `func`
-    /// \return result of calling `func(args)` on the designated instance
-    template <typename Ret, typename... FuncArgs, typename... Args, typename FutureRet = futurize_t<Ret>>
-    FutureRet
-    invoke_on(unsigned id, Ret (Service::*func)(FuncArgs...), Args&&... args) {
-        return invoke_on(id, smp_submit_to_options{}, func, std::forward<Args>(args)...);
-    }
-
     /// Invoke a callable on a specific instance of `Service`.
     ///
     /// \param id shard id to call
     /// \param options the options to forward to the \ref smp::submit_to()
     ///         called behind the scenes.
-    /// \param func a callable with signature `Value (Service&)` or
-    ///        `future<Value> (Service&)` (for some `Value` type)
+    /// \param func a callable with signature `Value (Service&, Args...)` or
+    ///        `future<Value> (Service&, Args...)` (for some `Value` type), or a pointer
+    ///        to a member function of Service
+    /// \param args parameters to the callable; will be copied or moved. To pass by reference,
+    ///              use std::ref().
+    ///
     /// \return result of calling `func(instance)` on the designated instance
-    template <typename Func, typename Ret = futurize_t<std::result_of_t<Func(Service&)>>>
+    template <typename Func, typename... Args, typename Ret = futurize_t<std::invoke_result_t<Func, Service&, Args...>>>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args&&...>)
     Ret
-    invoke_on(unsigned id, smp_submit_to_options options, Func&& func) {
-        return smp::submit_to(id, options, [this, func = std::forward<Func>(func)] () mutable {
+    invoke_on(unsigned id, smp_submit_to_options options, Func&& func, Args&&... args) {
+        return smp::submit_to(id, options, [this, func = std::forward<Func>(func), args = std::tuple(std::move(args)...)] () mutable {
             auto inst = get_local_service();
-            return func(*inst);
+            return std::apply(std::forward<Func>(func), std::tuple_cat(std::forward_as_tuple(*inst), std::move(args)));
         });
     }
 
@@ -442,12 +389,15 @@ public:
     ///
     /// \param id shard id to call
     /// \param func a callable with signature `Value (Service&)` or
-    ///        `future<Value> (Service&)` (for some `Value` type)
+    ///        `future<Value> (Service&)` (for some `Value` type), or a pointer
+    ///        to a member function of Service
+    /// \param args parameters to the callable
     /// \return result of calling `func(instance)` on the designated instance
-    template <typename Func, typename Ret = futurize_t<std::result_of_t<Func(Service&)>>>
+    template <typename Func, typename... Args, typename Ret = futurize_t<std::invoke_result_t<Func, Service&, Args&&...>>>
+    SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args&&...>)
     Ret
-    invoke_on(unsigned id, Func&& func) {
-        return invoke_on(id, smp_submit_to_options{}, std::forward<Func>(func));
+    invoke_on(unsigned id, Func&& func, Args&&... args) {
+        return invoke_on(id, smp_submit_to_options(), std::forward<Func>(func), std::forward<Args>(args)...);
     }
 
     /// Gets a reference to the local instance.
@@ -489,6 +439,56 @@ private:
     }
 };
 
+namespace internal {
+
+template <typename T>
+struct sharded_unwrap {
+    using type = T;
+};
+
+template <typename T>
+struct sharded_unwrap<std::reference_wrapper<sharded<T>>> {
+    using type = T&;
+};
+
+template <typename T>
+using sharded_unwrap_t = typename sharded_unwrap<T>::type;
+
+} // internal
+
+
+/// \brief Helper to pass a parameter to a `sharded<>` object that depends
+/// on the shard. It is evaluated on the shard, just before being
+/// passed to the local instance. It is useful when passing
+/// parameters to sharded::start().
+template <typename Func, typename... Params>
+class sharded_parameter {
+    Func _func;
+    std::tuple<Params...> _params;
+public:
+    /// Creates a sharded parameter, which evaluates differently based on
+    /// the shard it is executed on.
+    ///
+    /// \param func      Function to be executed
+    /// \param params    optional parameters to be passed to the function. Can
+    ///                  be std::ref(sharded<whatever>), in which case the local
+    ///                  instance will be passed. Anything else
+    ///                  will be passed by value unchanged.
+    explicit sharded_parameter(Func func, Params... params)
+            SEASTAR_CONCEPT(requires std::invocable<Func, internal::sharded_unwrap_t<Params>...>)
+            : _func(std::move(func)), _params(std::make_tuple(std::move(params)...)) {
+    }
+private:
+    auto evaluate() const;
+
+    template <typename Func_, typename... Param_>
+    friend auto internal::unwrap_sharded_arg(sharded_parameter<Func_, Param_...> sp);
+};
+
+/// \example sharded_parameter_demo.cc
+///
+/// Example use of \ref sharded_parameter.
+
 /// @}
 
 template <typename Service>
@@ -520,6 +520,21 @@ unwrap_sharded_arg(std::reference_wrapper<sharded<Service>> arg) {
     return either_sharded_or_local<Service>(arg);
 }
 
+template <typename Func, typename... Param>
+auto
+unwrap_sharded_arg(sharded_parameter<Func, Param...> sp) {
+    return sp.evaluate();
+}
+
+}
+
+template <typename Func, typename... Param>
+auto
+sharded_parameter<Func, Param...>::evaluate() const {
+    auto unwrap_params_and_invoke = [this] (const auto&... params) {
+        return std::invoke(_func, internal::unwrap_sharded_arg(params)...);
+    };
+    return std::apply(unwrap_params_and_invoke, _params);
 }
 
 namespace internal {
@@ -538,7 +553,7 @@ sharded<Service>::start(Args&&... args) {
     return internal::sharded_parallel_for_each(_instances.size(),
         [this, args = std::make_tuple(std::forward<Args>(args)...)] (unsigned c) mutable {
             return smp::submit_to(c, [this, args] () mutable {
-                _instances[this_shard_id()].service = apply([this] (Args... args) {
+                _instances[this_shard_id()].service = std::apply([this] (Args... args) {
                     return create_local_service(internal::unwrap_sharded_arg(std::forward<Args>(args))...);
                 }, args);
             });
@@ -561,7 +576,7 @@ sharded<Service>::start_single(Args&&... args) {
     assert(_instances.empty());
     _instances.resize(1);
     return smp::submit_to(0, [this, args = std::make_tuple(std::forward<Args>(args)...)] () mutable {
-        _instances[0].service = apply([this] (Args... args) {
+        _instances[0].service = std::apply([this] (Args... args) {
             return create_local_service(internal::unwrap_sharded_arg(std::forward<Args>(args))...);
         }, args);
     }).then_wrapped([this] (future<> f) {
@@ -638,16 +653,20 @@ sharded<Service>::stop() {
             }
             return internal::stop_sharded_instance(*inst);
         });
-    }).then([this] {
+    }).then_wrapped([this] (future<> fut) {
         return internal::sharded_parallel_for_each(_instances.size(), [this] (unsigned c) {
             return smp::submit_to(c, [this] {
+                if (_instances[this_shard_id()].service == nullptr) {
+                    return make_ready_future<>();
+                }
                 _instances[this_shard_id()].service = nullptr;
                 return _instances[this_shard_id()].freed.get_future();
             });
+        }).finally([this, fut = std::move(fut)] () mutable {
+            _instances.clear();
+            _instances = std::vector<sharded<Service>::entry>();
+            return std::move(fut);
         });
-    }).then([this] {
-        _instances.clear();
-        _instances = std::vector<sharded<Service>::entry>();
     });
 }
 
@@ -662,47 +681,28 @@ sharded<Service>::invoke_on_all(smp_submit_to_options options, std::function<fut
 }
 
 template <typename Service>
-template <typename... Args>
+template <typename Func, typename... Args>
+SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
 inline
 future<>
-sharded<Service>::invoke_on_all(smp_submit_to_options options, future<> (Service::*func)(Args...), Args... args) {
-    return invoke_on_all(options, invoke_on_all_func_type([func, args...] (Service& service) mutable {
-        return (service.*func)(args...);
-    }));
-}
-
-template <typename Service>
-template <typename... Args>
-inline
-future<>
-sharded<Service>::invoke_on_all(smp_submit_to_options options, void (Service::*func)(Args...), Args... args) {
-    return invoke_on_all(options, invoke_on_all_func_type([func, args...] (Service& service) mutable {
-        (service.*func)(args...);
-        return make_ready_future<>();
-    }));
-}
-
-template <typename Service>
-template <typename Func>
-inline
-future<>
-sharded<Service>::invoke_on_all(smp_submit_to_options options, Func&& func) {
-    static_assert(std::is_same<futurize_t<std::result_of_t<Func(Service&)>>, future<>>::value,
+sharded<Service>::invoke_on_all(smp_submit_to_options options, Func func, Args... args) {
+    static_assert(std::is_same_v<futurize_t<std::invoke_result_t<Func, Service&, Args...>>, future<>>,
                   "invoke_on_all()'s func must return void or future<>");
-    return invoke_on_all(options, invoke_on_all_func_type([func] (Service& service) mutable {
-        return futurize_invoke(func, service);
+    return invoke_on_all(options, invoke_on_all_func_type([func, args = std::tuple(std::move(args)...)] (Service& service) mutable {
+        return futurize_apply(func, std::tuple_cat(std::forward_as_tuple(service), args));
     }));
 }
 
 template <typename Service>
-template <typename Func>
+template <typename Func, typename... Args>
+SEASTAR_CONCEPT(requires std::invocable<Func, Service&, Args...>)
 inline
 future<>
-sharded<Service>::invoke_on_others(smp_submit_to_options options, Func&& func) {
-    static_assert(std::is_same<futurize_t<std::result_of_t<Func(Service&)>>, future<>>::value,
+sharded<Service>::invoke_on_others(smp_submit_to_options options, Func func, Args... args) {
+    static_assert(std::is_same_v<futurize_t<std::invoke_result_t<Func, Service&, Args...>>, future<>>,
                   "invoke_on_others()'s func must return void or future<>");
-    return invoke_on_all(options, [orig = this_shard_id(), func = std::forward<Func>(func)] (auto& s) -> future<> {
-        return this_shard_id() == orig ? make_ready_future<>() : futurize_invoke(func, s);
+    return invoke_on_all(options, [orig = this_shard_id(), func = std::move(func), args = std::tuple(std::move(args)...)] (Service& s) -> future<> {
+        return this_shard_id() == orig ? make_ready_future<>() : futurize_apply(func, std::tuple_cat(std::forward_as_tuple(s), args));;
     });
 }
 
@@ -749,7 +749,7 @@ inline bool sharded<Service>::local_is_initialized() const {
 ///
 /// \c foreign_ptr<> provides a solution to that problem.
 /// \c foreign_ptr<> wraps any pointer type -- raw pointer,
-/// \ref shared_ptr<>, or similar, and remembers on what core this
+/// \ref seastar::shared_ptr<>, or similar, and remembers on what core this
 /// happened.  When the \c foreign_ptr<> object is destroyed, it
 /// sends a message to the original core so that the wrapped object
 /// can be safely destroyed.
@@ -762,7 +762,7 @@ private:
     PtrType _value;
     unsigned _cpu;
 private:
-    void destroy(PtrType p, unsigned cpu) {
+    void destroy(PtrType p, unsigned cpu) noexcept {
         if (p && this_shard_id() != cpu) {
             // `destroy()` is called from the destructor and other
             // synchronous methods (like `reset()`), that have no way to
@@ -780,14 +780,14 @@ public:
     using pointer = element_type*;
 
     /// Constructs a null \c foreign_ptr<>.
-    foreign_ptr()
+    foreign_ptr() noexcept(std::is_nothrow_default_constructible_v<PtrType>)
         : _value(PtrType())
         , _cpu(this_shard_id()) {
     }
     /// Constructs a null \c foreign_ptr<>.
-    foreign_ptr(std::nullptr_t) : foreign_ptr() {}
+    foreign_ptr(std::nullptr_t) noexcept(std::is_nothrow_default_constructible_v<foreign_ptr>) : foreign_ptr() {}
     /// Wraps a pointer object and remembers the current core.
-    foreign_ptr(PtrType value)
+    foreign_ptr(PtrType value) noexcept(std::is_nothrow_move_constructible_v<PtrType>)
         : _value(std::move(value))
         , _cpu(this_shard_id()) {
     }
@@ -795,31 +795,31 @@ public:
     // are expensive because each copy requires across-CPU call.
     foreign_ptr(const foreign_ptr&) = delete;
     /// Moves a \c foreign_ptr<> to another object.
-    foreign_ptr(foreign_ptr&& other) = default;
+    foreign_ptr(foreign_ptr&& other) noexcept(std::is_nothrow_move_constructible_v<PtrType>) = default;
     /// Destroys the wrapped object on its original cpu.
     ~foreign_ptr() {
         destroy(std::move(_value), _cpu);
     }
     /// Creates a copy of this foreign ptr. Only works if the stored ptr is copyable.
-    future<foreign_ptr> copy() const {
+    future<foreign_ptr> copy() const noexcept {
         return smp::submit_to(_cpu, [this] () mutable {
             auto v = _value;
             return make_foreign(std::move(v));
         });
     }
     /// Accesses the wrapped object.
-    element_type& operator*() const { return *_value; }
+    element_type& operator*() const noexcept(noexcept(*_value)) { return *_value; }
     /// Accesses the wrapped object.
-    element_type* operator->() const { return &*_value; }
+    element_type* operator->() const noexcept(noexcept(&*_value)) { return &*_value; }
     /// Access the raw pointer to the wrapped object.
-    pointer get() const { return &*_value; }
+    pointer get() const  noexcept(noexcept(&*_value)) { return &*_value; }
     /// Return the owner-shard of this pointer.
     ///
     /// The owner shard of the pointer can change as a result of
     /// move-assigment or a call to reset().
-    unsigned get_owner_shard() const { return _cpu; }
+    unsigned get_owner_shard() const noexcept { return _cpu; }
     /// Checks whether the wrapped pointer is non-null.
-    operator bool() const { return static_cast<bool>(_value); }
+    operator bool() const noexcept(noexcept(static_cast<bool>(_value))) { return static_cast<bool>(_value); }
     /// Move-assigns a \c foreign_ptr<>.
     foreign_ptr& operator=(foreign_ptr&& other) noexcept(std::is_nothrow_move_constructible<PtrType>::value) {
          destroy(std::move(_value), _cpu);
@@ -832,13 +832,13 @@ public:
     /// Warning: the caller is now responsible for destroying the
     /// pointer on its owner shard. This method is best called on the
     /// owner shard to avoid accidents.
-    PtrType release() {
+    PtrType release() noexcept(std::is_nothrow_default_constructible_v<PtrType>) {
         return std::exchange(_value, {});
     }
     /// Replace the managed pointer with new_ptr.
     ///
     /// The previous managed pointer is destroyed on its owner shard.
-    void reset(PtrType new_ptr) {
+    void reset(PtrType new_ptr) noexcept(std::is_nothrow_move_constructible_v<PtrType>) {
         auto old_ptr = std::move(_value);
         auto old_cpu = _cpu;
 
@@ -850,7 +850,7 @@ public:
     /// Replace the managed pointer with a null value.
     ///
     /// The previous managed pointer is destroyed on its owner shard.
-    void reset(std::nullptr_t = nullptr) {
+    void reset(std::nullptr_t = nullptr) noexcept(std::is_nothrow_default_constructible_v<PtrType>) {
         reset(PtrType());
     }
 };

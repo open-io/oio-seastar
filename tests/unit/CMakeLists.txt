@@ -89,9 +89,8 @@ function (seastar_add_test name)
 
     set (libraries "${parsed_args_LIBRARIES}")
 
+    set (args "")
     if (parsed_args_KIND STREQUAL "SEASTAR")
-      set (args "")
-
       list (APPEND libraries
         seastar_testing
         seastar_private)
@@ -101,10 +100,7 @@ function (seastar_add_test name)
       endif ()
 
       list (APPEND args -- -c ${Seastar_UNIT_TEST_SMP})
-      list (APPEND args ${parsed_args_RUN_ARGS})
     elseif (parsed_args_KIND STREQUAL "BOOST")
-      set (args "")
-
       list (APPEND libraries
         Boost::unit_test_framework
         seastar_private)
@@ -112,11 +108,9 @@ function (seastar_add_test name)
       if (NOT (Seastar_JENKINS STREQUAL ""))
         list (APPEND args ${jenkins_args})
       endif ()
-
-      list (APPEND args ${parsed_args_RUN_ARGS})
-    else () # CUSTOM
-      set (args ${parsed_args_RUN_ARGS})
     endif ()
+
+    list (APPEND args ${parsed_args_RUN_ARGS})
 
     set (executable_target test_unit_${name})
     add_executable (${executable_target} ${parsed_args_SOURCES})
@@ -265,10 +259,8 @@ seastar_add_test (circular_buffer_fixed_capacity
 seastar_add_test (connect
   SOURCES connect_test.cc)
 
-if (Seastar_EXPERIMENTAL_COROUTINES_TS)
-  seastar_add_test (coroutines
-    SOURCES coroutines_test.cc)
-endif ()
+seastar_add_test (coroutines
+  SOURCES coroutines_test.cc)
 
 seastar_add_test (defer
   SOURCES defer_test.cc)
@@ -279,7 +271,7 @@ seastar_add_test (deleter
 seastar_add_app_test (directory
   SOURCES directory_test.cc)
 
-seastar_add_app_test (distributed
+seastar_add_test (distributed
   SOURCES distributed_test.cc)
 
 seastar_add_test (dns
@@ -331,6 +323,9 @@ seastar_add_test (network_interface
 seastar_add_test (json_formatter
   SOURCES json_formatter_test.cc)
 
+seastar_add_test (locking
+  SOURCES locking_test.cc)
+
 seastar_add_test (lowres_clock
   SOURCES lowres_clock_test.cc)
 
@@ -358,6 +353,9 @@ seastar_add_test (program_options
 
 seastar_add_test (queue
   SOURCES queue_test.cc)
+
+seastar_add_test (request_parser
+  SOURCES request_parser_test.cc)
 
 seastar_add_test (rpc
   SOURCES

@@ -71,7 +71,7 @@ struct semaphore_default_exception_factory {
 class named_semaphore_timed_out : public semaphore_timed_out {
     sstring _msg;
 public:
-    named_semaphore_timed_out(compat::string_view msg);
+    named_semaphore_timed_out(std::string_view msg);
     virtual const char* what() const noexcept {
         return _msg.c_str();
     }
@@ -80,7 +80,7 @@ public:
 class broken_named_semaphore : public broken_semaphore {
     sstring _msg;
 public:
-    broken_named_semaphore(compat::string_view msg);
+    broken_named_semaphore(std::string_view msg);
     virtual const char* what() const noexcept {
         return _msg.c_str();
     }
@@ -192,12 +192,12 @@ public:
         if (_ex) {
             return make_exception_future(_ex);
         }
-        promise<> pr;
-        auto fut = pr.get_future();
+        entry e(promise<>(), nr);
+        auto fut = e.pr.get_future();
         try {
-            _wait_list.push_back(entry(std::move(pr), nr), timeout);
+            _wait_list.push_back(std::move(e), timeout);
         } catch (...) {
-            pr.set_exception(std::current_exception());
+            e.pr.set_exception(std::current_exception());
         }
         return fut;
     }
@@ -247,7 +247,7 @@ public:
     /// cause the counter to go negative.
     ///
     /// \param nr Amount of units to consume (default 1).
-    void consume(size_t nr = 1) {
+    void consume(size_t nr = 1) noexcept {
         if (_ex) {
             return;
         }
@@ -354,7 +354,9 @@ public:
     /// Splits this instance into a \ref semaphore_units object holding the specified amount of units.
     /// This object will continue holding the remaining units.
     ///
-    /// noexcept if \ref units <= \ref _n
+    /// \param units number of units to subtract.
+    ///
+    /// \note throws exception if \c units is more than those protected by the semaphore
     ///
     /// \return semaphore_units holding the specified number of units
     semaphore_units split(size_t units) {
@@ -408,7 +410,7 @@ get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) noexcept 
 /// \brief Take units from semaphore temporarily with time bound on wait
 ///
 /// Like \ref get_units(basic_semaphore<ExceptionFactory>&, size_t) but when
-/// timeout is reached before units are granted throws semaphore_timed_out exception.
+/// timeout is reached before units are granted returns an exceptional future holding semaphore_timed_out.
 ///
 /// \param sem The semaphore to take units from
 /// \param units  Number of units to take
@@ -465,7 +467,7 @@ get_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units, typename 
 /// \param units  Number of units to consume
 template<typename ExceptionFactory, typename Clock = typename timer<>::clock>
 semaphore_units<ExceptionFactory, Clock>
-consume_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) {
+consume_units(basic_semaphore<ExceptionFactory, Clock>& sem, size_t units) noexcept {
     sem.consume(units);
     return semaphore_units<ExceptionFactory, Clock>{ sem, units };
 }

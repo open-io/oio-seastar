@@ -101,6 +101,10 @@ alloc_failure_injector& local_failure_injector() {
 
 #ifdef SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION
 
+#ifdef SEASTAR_DEFAULT_ALLOCATOR
+#error SEASTAR_ENABLE_ALLOC_FAILURE_INJECTION is not supported when using SEASTAR_DEFAULT_ALLOCATOR
+#endif
+
 struct disable_failure_guard {
     disable_failure_guard() { ++local_failure_injector()._suppressed; }
     ~disable_failure_guard() { --local_failure_injector()._suppressed; }
@@ -121,6 +125,13 @@ void on_alloc_point() {
     local_failure_injector().on_alloc_point();
 #endif
 }
+
+/// Repeatedly run func with allocation failures
+///
+/// Initially, allocations start to fail immediately. In each
+/// subsequent run the failures start one allocation later. This
+/// returns when func is run and no allocation failures are detected.
+void with_allocation_failures(noncopyable_function<void()> func);
 
 }
 }

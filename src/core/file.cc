@@ -35,12 +35,16 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/report_exception.hh>
 #include <seastar/core/linux-aio.hh>
+#include <seastar/util/later.hh>
 #include "core/file-impl.hh"
 #include "core/syscall_result.hh"
 #include "core/thread_pool.hh"
 #include "core/uname.hh"
 
 namespace seastar {
+
+static_assert(std::is_nothrow_copy_constructible_v<io_priority_class>);
+static_assert(std::is_nothrow_move_constructible_v<io_priority_class>);
 
 using namespace internal;
 using namespace internal::linux_abi;
@@ -277,7 +281,7 @@ posix_file_impl::list_directory(std::function<future<> (directory_entry de)> nex
             }
             auto start = w->buffer + w->current;
             auto de = reinterpret_cast<linux_dirent64*>(start);
-            compat::optional<directory_entry_type> type;
+            std::optional<directory_entry_type> type;
             switch (de->d_type) {
             case DT_BLK:
                 type = directory_entry_type::block_device;
@@ -421,7 +425,7 @@ posix_file_impl::read_maybe_eof(uint64_t pos, size_t len, const io_priority_clas
     return read_dma(pos, dst, buf_size, pc).then_wrapped(
             [buf = std::move(buf)](future<size_t> f) mutable {
         try {
-            size_t size = std::get<0>(f.get());
+            size_t size = f.get0();
 
             buf.trim(size);
 
@@ -853,6 +857,130 @@ file::file(seastar::file_handle&& handle) noexcept
         : _file_impl(std::move(std::move(handle).to_file()._file_impl)) {
 }
 
+future<uint64_t> file::size() const noexcept {
+  try {
+    return _file_impl->size();
+  } catch (...) {
+    return current_exception_as_future<uint64_t>();
+  }
+}
+
+future<> file::close() noexcept {
+    return do_with(shared_ptr<file_impl>(_file_impl), [](shared_ptr<file_impl>& f) {
+        return f->close();
+    });
+}
+
+subscription<directory_entry>
+file::list_directory(std::function<future<>(directory_entry de)> next) {
+    return _file_impl->list_directory(std::move(next));
+}
+
+future<temporary_buffer<uint8_t>>
+file::dma_read_bulk_impl(uint64_t offset, size_t range_size, const io_priority_class& pc) noexcept {
+  try {
+    return _file_impl->dma_read_bulk(offset, range_size, pc);
+  } catch (...) {
+    return current_exception_as_future<temporary_buffer<uint8_t>>();
+  }
+}
+
+future<> file::discard(uint64_t offset, uint64_t length) noexcept {
+  try {
+    return _file_impl->discard(offset, length);
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+future<> file::allocate(uint64_t position, uint64_t length) noexcept {
+  try {
+    return _file_impl->allocate(position, length);
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+future<> file::truncate(uint64_t length) noexcept {
+  try {
+    return _file_impl->truncate(length);
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+future<struct stat> file::stat() noexcept {
+  try {
+    return _file_impl->stat();
+  } catch (...) {
+    return current_exception_as_future<struct stat>();
+  }
+}
+
+future<> file::flush() noexcept {
+  try {
+    return _file_impl->flush();
+  } catch (...) {
+    return current_exception_as_future();
+  }
+}
+
+future<size_t> file::dma_write(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) noexcept {
+  try {
+    return _file_impl->write_dma(pos, std::move(iov), pc);
+  } catch (...) {
+    return current_exception_as_future<size_t>();
+  }
+}
+
+future<size_t>
+file::dma_write_impl(uint64_t pos, const uint8_t* buffer, size_t len, const io_priority_class& pc) noexcept {
+  try {
+    return _file_impl->write_dma(pos, buffer, len, pc);
+  } catch (...) {
+    return current_exception_as_future<size_t>();
+  }
+}
+
+future<size_t> file::dma_read(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) noexcept {
+  try {
+    return _file_impl->read_dma(pos, std::move(iov), pc);
+  } catch (...) {
+    return current_exception_as_future<size_t>();
+  }
+}
+
+future<temporary_buffer<uint8_t>>
+file::dma_read_exactly_impl(uint64_t pos, size_t len, const io_priority_class& pc) noexcept {
+    return dma_read<uint8_t>(pos, len, pc).then([len](auto buf) {
+        if (buf.size() < len) {
+            throw eof_error();
+        }
+
+        return buf;
+    });
+}
+
+future<temporary_buffer<uint8_t>>
+file::dma_read_impl(uint64_t pos, size_t len, const io_priority_class& pc) noexcept {
+    return dma_read_bulk<uint8_t>(pos, len, pc).then([len](temporary_buffer<uint8_t> buf) {
+        if (len < buf.size()) {
+            buf.trim(len);
+        }
+
+        return buf;
+    });
+}
+
+future<size_t>
+file::dma_read_impl(uint64_t aligned_pos, uint8_t* aligned_buffer, size_t aligned_len, const io_priority_class& pc) noexcept {
+  try {
+    return _file_impl->read_dma(aligned_pos, aligned_buffer, aligned_len, pc);
+  } catch (...) {
+    return current_exception_as_future<size_t>();
+  }
+}
+
 seastar::file_handle
 file::dup() {
     return seastar::file_handle(_file_impl->dup());
@@ -867,16 +995,16 @@ file_impl::dup() {
     throw std::runtime_error("this file type cannot be duplicated");
 }
 
-future<file> open_file_dma(sstring name, open_flags flags) noexcept {
-    return engine().open_file_dma(std::move(name), flags, file_open_options());
+future<file> open_file_dma(std::string_view name, open_flags flags) noexcept {
+    return engine().open_file_dma(name, flags, file_open_options());
 }
 
-future<file> open_file_dma(sstring name, open_flags flags, file_open_options options) noexcept {
-    return engine().open_file_dma(std::move(name), flags, std::move(options));
+future<file> open_file_dma(std::string_view name, open_flags flags, file_open_options options) noexcept {
+    return engine().open_file_dma(name, flags, std::move(options));
 }
 
-future<file> open_directory(sstring name) noexcept {
-    return engine().open_directory(std::move(name));
+future<file> open_directory(std::string_view name) noexcept {
+    return engine().open_directory(name);
 }
 
 }

@@ -27,6 +27,7 @@
 #include <atomic>
 #include <mutex>
 #include <boost/lexical_cast.hpp>
+#include <fmt/format.h>
 
 
 /// \addtogroup logging
@@ -81,48 +82,34 @@ class logger {
     static std::atomic<bool> _ostream;
     static std::atomic<bool> _syslog;
 private:
-    struct stringer {
-        void (*append)(std::ostream& os, const void* object);
-        const void* object;
-    };
-    template <typename Arg>
-    stringer stringer_for(const Arg& arg) {
-        return stringer{
-            [] (std::ostream& os, const void* object) {
-                os << *static_cast<const std::remove_reference_t<Arg>*>(object);
-            },
-            &arg
-        };
-    };
-    template <typename... Args>
-    void do_log(log_level level, const char* fmt, Args&&... args);
-    void really_do_log(log_level level, const char* fmt, const stringer* stringers, size_t n);
-    void failed_to_log(std::exception_ptr ex);
+
+    void do_log(log_level level, const char* fmt, fmt::format_args args);
+    void failed_to_log(std::exception_ptr ex) noexcept;
 public:
     explicit logger(sstring name);
     logger(logger&& x);
     ~logger();
 
-    bool is_shard_zero();
+    bool is_shard_zero() noexcept;
 
     /// Test if desired log level is enabled
     ///
     /// \param level - enum level value (info|error...)
     /// \return true if the log level has been enabled.
-    bool is_enabled(log_level level) const {
+    bool is_enabled(log_level level) const noexcept {
         return __builtin_expect(level <= _level.load(std::memory_order_relaxed), false);
     }
 
     /// logs to desired level if enabled, otherwise we ignore the log line
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void log(log_level level, const char* fmt, const Args&... args) {
+    void log(log_level level, const char* fmt, Args&&... args) noexcept {
         if (is_enabled(level)) {
             try {
-                do_log(level, fmt, args...);
+                do_log(level, fmt, fmt::make_format_args(std::forward<Args>(args)...));
             } catch (...) {
                 failed_to_log(std::current_exception());
             }
@@ -132,100 +119,100 @@ public:
     /// Log with error tag:
     /// ERROR  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void error(const char* fmt, Args&&... args) {
+    void error(const char* fmt, Args&&... args) noexcept {
         log(log_level::error, fmt, std::forward<Args>(args)...);
     }
     /// Log with warning tag:
     /// WARN  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void warn(const char* fmt, Args&&... args) {
+    void warn(const char* fmt, Args&&... args) noexcept {
         log(log_level::warn, fmt, std::forward<Args>(args)...);
     }
     /// Log with info tag:
     /// INFO  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void info(const char* fmt, Args&&... args) {
+    void info(const char* fmt, Args&&... args) noexcept {
         log(log_level::info, fmt, std::forward<Args>(args)...);
     }
     /// Log with info tag on shard zero only:
     /// INFO  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void info0(const char* fmt, Args&&... args) {
+    void info0(const char* fmt, Args&&... args) noexcept {
         if (is_shard_zero()) {
             log(log_level::info, fmt, std::forward<Args>(args)...);
         }
     }
-    /// Log with info tag:
+    /// Log with debug tag:
     /// DEBUG  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void debug(const char* fmt, Args&&... args) {
+    void debug(const char* fmt, Args&&... args) noexcept {
         log(log_level::debug, fmt, std::forward<Args>(args)...);
     }
     /// Log with trace tag:
     /// TRACE  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
     ///
-    /// \param fmt - printf style format
+    /// \param fmt - {fmt} style format
     /// \param args - args to print string
     ///
     template <typename... Args>
-    void trace(const char* fmt, Args&&... args) {
+    void trace(const char* fmt, Args&&... args) noexcept {
         log(log_level::trace, fmt, std::forward<Args>(args)...);
     }
 
     /// \return name of the logger. Usually one logger per module
     ///
-    const sstring& name() const {
+    const sstring& name() const noexcept {
         return _name;
     }
 
     /// \return current log level for this logger
     ///
-    log_level level() const {
+    log_level level() const noexcept {
         return _level.load(std::memory_order_relaxed);
     }
 
     /// \param level - set the log level
     ///
-    void set_level(log_level level) {
+    void set_level(log_level level) noexcept {
         _level.store(level, std::memory_order_relaxed);
     }
 
     /// Set output stream, default is std::cerr
-    static void set_ostream(std::ostream& out);
+    static void set_ostream(std::ostream& out) noexcept;
 
     /// Also output to ostream. default is true
-    static void set_ostream_enabled(bool enabled);
+    static void set_ostream_enabled(bool enabled) noexcept;
 
     /// Also output to stdout. default is true
     [[deprecated("Use set_ostream_enabled instead")]]
-    static void set_stdout_enabled(bool enabled);
+    static void set_stdout_enabled(bool enabled) noexcept;
 
     /// Also output to syslog. default is false
     ///
     /// NOTE: syslog() can block, which will stall the reactor thread.
     ///       this should be rare (will have to fill the pipe buffer
     ///       before syslogd can clear it) but can happen.
-    static void set_syslog_enabled(bool enabled);
+    static void set_syslog_enabled(bool enabled) noexcept;
 };
 
 /// \brief used to keep a static registry of loggers
@@ -319,15 +306,6 @@ class logger_for : public logger {
 public:
     logger_for() : logger(pretty_type_name(typeid(T))) {}
 };
-
-template <typename... Args>
-void
-logger::do_log(log_level level, const char* fmt, Args&&... args) {
-    [&](auto... stringers) {
-        stringer s[sizeof...(stringers)] = {stringers...};
-        this->really_do_log(level, fmt, s, sizeof...(stringers));
-    } (stringer_for<Args>(std::forward<Args>(args))...);
-}
 
 /// \endcond
 } // end seastar namespace

@@ -24,10 +24,8 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/print.hh>
 #include <seastar/core/app-template.hh>
-#include <seastar/core/future-util.hh>
 #include <seastar/core/distributed.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/future-util.hh>
 #include <chrono>
 
 using namespace seastar;
@@ -174,7 +172,10 @@ public:
 namespace bpo = boost::program_options;
 
 int main(int ac, char** av) {
-    app_template app;
+    app_template::config app_cfg;
+    app_cfg.auto_handle_sigint_sigterm = false;
+    app_template app(std::move(app_cfg));
+
     app.add_options()
         ("server,s", bpo::value<std::string>()->default_value("192.168.66.100:10000"), "Server address")
         ("conn,c", bpo::value<unsigned>()->default_value(100), "total connections")

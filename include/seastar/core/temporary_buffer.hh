@@ -78,7 +78,7 @@ public:
     }
     //explicit temporary_buffer(CharType* borrow, size_t size) : _buffer(borrow), _size(size) {}
     /// Creates an empty \c temporary_buffer that does not point at anything.
-    temporary_buffer()
+    temporary_buffer() noexcept
         : _buffer(nullptr)
         , _size(0) {}
     temporary_buffer(const temporary_buffer&) = delete;
@@ -214,7 +214,7 @@ public:
         return temporary_buffer(buf, size, make_free_deleter(buf));
     }
 
-    static temporary_buffer copy_of(compat::string_view view) {
+    static temporary_buffer copy_of(std::string_view view) {
         void* ptr = ::malloc(view.size());
         if (!ptr) {
             throw std::bad_alloc();

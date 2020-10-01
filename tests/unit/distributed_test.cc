@@ -20,9 +20,10 @@
  * Copyright (C) 2015 Cloudius Systems, Ltd.
  */
 
-#include <seastar/core/app-template.hh>
+#include <seastar/testing/test_case.hh>
+#include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/distributed.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
@@ -72,7 +73,7 @@ future<> do_with_distributed(Func&& func) {
     }).finally([x]{});
 }
 
-future<> test_that_each_core_gets_the_arguments() {
+SEASTAR_TEST_CASE(test_that_each_core_gets_the_arguments) {
     return do_with_distributed<X>([] (auto& x) {
         return x.start().then([&x] {
             return x.map_reduce([] (sstring msg){
@@ -84,7 +85,7 @@ future<> test_that_each_core_gets_the_arguments() {
     });
 }
 
-future<> test_functor_version() {
+SEASTAR_TEST_CASE(test_functor_version) {
     return do_with_distributed<X>([] (auto& x) {
         return x.start().then([&x] {
             return x.map_reduce([] (sstring msg){
@@ -102,7 +103,7 @@ struct Y {
     future<> stop() { return make_ready_future<>(); }
 };
 
-future<> test_constructor_argument_is_passed_to_each_core() {
+SEASTAR_TEST_CASE(test_constructor_argument_is_passed_to_each_core) {
     return do_with_distributed<Y>([] (auto& y) {
         return y.start(sstring("hello")).then([&y] {
             return y.invoke_on_all([] (Y& y) {
@@ -114,7 +115,7 @@ future<> test_constructor_argument_is_passed_to_each_core() {
     });
 }
 
-future<> test_map_reduce() {
+SEASTAR_TEST_CASE(test_map_reduce) {
     return do_with_distributed<X>([] (distributed<X>& x) {
         return x.start().then([&x] {
             return x.map_reduce0(std::mem_fn(&X::cpu_id_squared),
@@ -129,7 +130,7 @@ future<> test_map_reduce() {
     });
 }
 
-future<> test_async() {
+SEASTAR_TEST_CASE(test_async) {
     return do_with_distributed<async_service>([] (distributed<async_service>& x) {
         return x.start().then([&x] {
             return x.invoke_on_all(&async_service::run);
@@ -139,7 +140,7 @@ future<> test_async() {
     });
 }
 
-future<> test_invoke_on_others() {
+SEASTAR_TEST_CASE(test_invoke_on_others) {
     return seastar::async([] {
         struct my_service {
             int counter = 0;
@@ -198,7 +199,7 @@ struct remote_worker {
     }
 };
 
-future<> test_smp_service_groups() {
+SEASTAR_TEST_CASE(test_smp_service_groups) {
     return async([] {
         smp_service_group_config ssgc1;
         ssgc1.max_nonlocal_requests = 1;
@@ -222,7 +223,7 @@ future<> test_smp_service_groups() {
     });
 }
 
-future<> test_smp_service_groups_re_construction() {
+SEASTAR_TEST_CASE(test_smp_service_groups_re_construction) {
     // During development of the feature, we saw a bug where the vector
     // holding the groups did not expand correctly. This test triggers the
     // bug.
@@ -236,7 +237,7 @@ future<> test_smp_service_groups_re_construction() {
     });
 }
 
-future<> test_smp_timeout() {
+SEASTAR_TEST_CASE(test_smp_timeout) {
     return async([] {
         smp_service_group_config ssgc1;
         ssgc1.max_nonlocal_requests = 1;
@@ -285,25 +286,33 @@ future<> test_smp_timeout() {
     });
 }
 
-int main(int argc, char** argv) {
-    app_template app;
-    return app.run(argc, argv, [] {
-        return test_that_each_core_gets_the_arguments().then([] {
-            return test_functor_version();
-        }).then([] {
-            return test_constructor_argument_is_passed_to_each_core();
-        }).then([] {
-            return test_map_reduce();
-        }).then([] {
-            return test_async();
-        }).then([] {
-            return test_invoke_on_others();
-        }).then([] {
-            return test_smp_service_groups();
-        }).then([] {
-            return test_smp_service_groups_re_construction();
-        }).then([] {
-            return test_smp_timeout();
-        });
-    });
+SEASTAR_THREAD_TEST_CASE(test_sharded_parameter) {
+    struct dependency {
+        unsigned val = this_shard_id() * 7;
+    };
+    struct some_service {
+        bool ok = false;
+        some_service(unsigned non_shard_dependent, unsigned shard_dependent, dependency& dep, unsigned shard_dependent_2) {
+            ok =
+                    non_shard_dependent == 43
+                    && shard_dependent == this_shard_id() * 3
+                    && dep.val == this_shard_id() * 7
+                    && shard_dependent_2 == -dep.val;
+        }
+    };
+    sharded<dependency> s_dep;
+    s_dep.start().get();
+    auto undo1 = defer([&] { s_dep.stop().get(); });
+
+    sharded<some_service> s_service;
+    s_service.start(
+            43, // should be copied verbatim
+            sharded_parameter([] { return this_shard_id() * 3; }),
+            std::ref(s_dep),
+            sharded_parameter([] (dependency& d) { return -d.val; }, std::ref(s_dep))
+            ).get();
+    auto undo2 = defer([&] { s_service.stop().get(); });
+
+    auto all_ok = s_service.map_reduce0(std::mem_fn(&some_service::ok), true, std::multiplies<>()).get0();
+    BOOST_REQUIRE(all_ok);
 }

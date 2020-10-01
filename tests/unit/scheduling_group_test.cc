@@ -32,6 +32,8 @@
 #include <seastar/core/print.hh>
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/core/with_scheduling_group.hh>
+#include <seastar/util/later.hh>
 
 using namespace std::chrono_literals;
 
@@ -232,5 +234,18 @@ SEASTAR_THREAD_TEST_CASE(sg_scheduling_group_inheritance_in_seastar_async_test) 
                 BOOST_REQUIRE_EQUAL(internal::scheduling_group_index(current_scheduling_group()), sched_group_idx);
             }).get();
         }).get();
+    }).get();
+}
+
+
+SEASTAR_THREAD_TEST_CASE(later_preserves_sg) {
+    scheduling_group sg = create_scheduling_group("sg", 100).get0();
+    auto cleanup = defer([&] { destroy_scheduling_group(sg).get(); });
+    with_scheduling_group(sg, [&] {
+        return later().then([&] {
+            BOOST_REQUIRE_EQUAL(
+                    internal::scheduling_group_index(current_scheduling_group()),
+                    internal::scheduling_group_index(sg));
+        });
     }).get();
 }

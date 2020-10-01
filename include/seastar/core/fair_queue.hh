@@ -56,13 +56,13 @@ public:
     /// \param desc another \ref fair_queue_ticket whose \c weight \c and size will be decremented from this one
     fair_queue_ticket& operator-=(fair_queue_ticket desc);
 
-    /// \returns true if this fair_queue_ticket is less than \c rhs.
+    /// \returns true if this fair_queue_ticket is strictly less than \c rhs.
     ///
-    /// For a fair_queue_ticket to be considered less than another, both its quantities need to be
+    /// For a fair_queue_ticket to be considered strictly less than another, both its quantities need to be
     /// less than the other. Note that there is no total ordering between two fair_queue_tickets
     //
     /// \param rhs another \ref fair_queue_ticket to be compared to this one.
-    bool operator<(fair_queue_ticket rhs) const;
+    bool strictly_less(fair_queue_ticket rhs) const;
 
     /// \returns true if the fair_queue_ticket represents a non-zero quantity.
     ///
@@ -104,15 +104,16 @@ class priority_class {
     bool _queued = false;
 
     friend struct shared_ptr_no_esft<priority_class>;
-    explicit priority_class(uint32_t shares) : _shares(std::max(shares, 1u)) {}
+    explicit priority_class(uint32_t shares) noexcept : _shares(std::max(shares, 1u)) {}
 
-    void update_shares(uint32_t shares) {
-        _shares = (std::max(shares, 1u));
-    }
 public:
     /// \brief return the current amount of shares for this priority class
-    uint32_t shares() const {
+    uint32_t shares() const noexcept {
         return _shares;
+    }
+
+    void update_shares(uint32_t shares) noexcept {
+        _shares = (std::max(shares, 1u));
     }
 };
 /// \endcond
@@ -136,7 +137,7 @@ using priority_class_ptr = lw_shared_ptr<priority_class>;
 /// 1 share. Higher weights for a request will consume a proportionally higher amount of
 /// shares.
 ///
-/// The user of this interface is expected to register multiple \ref priority_class
+/// The user of this interface is expected to register multiple `priority_class`
 /// objects, which will each have a shares attribute.
 ///
 /// Internally, each priority class may keep a separate queue of requests.
@@ -203,7 +204,7 @@ public:
 
     /// Registers a priority class against this fair queue.
     ///
-    /// \param shares, how many shares to create this class with
+    /// \param shares how many shares to create this class with
     priority_class_ptr register_priority_class(uint32_t shares);
 
     /// Unregister a priority class.
@@ -236,15 +237,10 @@ public:
 
     /// Notifies that ont request finished
     /// \param desc an instance of \c fair_queue_ticket structure describing the request that just finished.
-    void notify_requests_finished(fair_queue_ticket desc);
+    void notify_requests_finished(fair_queue_ticket desc, unsigned nr = 1) noexcept;
 
     /// Try to execute new requests if there is capacity left in the queue.
     void dispatch_requests();
-
-    /// Updates the current shares of this priority class
-    ///
-    /// \param new_shares the new number of shares for this priority class
-    static void update_shares(priority_class_ptr pc, uint32_t new_shares);
 };
 /// @}
 

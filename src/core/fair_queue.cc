@@ -65,7 +65,7 @@ fair_queue_ticket& fair_queue_ticket::operator-=(fair_queue_ticket desc) {
     return *this;
 }
 
-bool fair_queue_ticket::operator<(fair_queue_ticket rhs) const {
+bool fair_queue_ticket::strictly_less(fair_queue_ticket rhs) const {
     return (_weight < rhs._weight) && (_size < rhs._size);
 }
 
@@ -114,7 +114,7 @@ void fair_queue::normalize_stats() {
 }
 
 bool fair_queue::can_dispatch() const {
-    return _resources_queued && (_resources_executing < _current_capacity);
+    return _resources_queued && (_resources_executing.strictly_less(_current_capacity));
 }
 
 priority_class_ptr fair_queue::register_priority_class(uint32_t shares) {
@@ -149,13 +149,14 @@ void fair_queue::queue(priority_class_ptr pc, fair_queue_ticket desc, noncopyabl
     // Since we don't know which queue we will use to execute the next request - if ours or
     // someone else's, we need a separate promise at this point.
     push_priority_class(pc);
-    _resources_queued += desc;
     pc->_queue.push_back(priority_class::request{std::move(func), std::move(desc)});
+    _resources_queued += desc;
     _requests_queued++;
 }
 
-void fair_queue::notify_requests_finished(fair_queue_ticket desc) {
+void fair_queue::notify_requests_finished(fair_queue_ticket desc, unsigned nr) noexcept {
     _resources_executing -= desc;
+    _requests_executing -= nr;
 }
 
 void fair_queue::dispatch_requests() {
@@ -190,10 +191,6 @@ void fair_queue::dispatch_requests() {
         }
         req.func();
     }
-}
-
-void fair_queue::update_shares(priority_class_ptr pc, uint32_t new_shares) {
-    pc->update_shares(new_shares);
 }
 
 }
