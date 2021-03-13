@@ -21,6 +21,9 @@
 #pragma once
 
 #include <seastar/core/sstring.hh>
+#include <seastar/util/concepts.hh>
+#include <seastar/util/log-impl.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <unordered_map>
 #include <exception>
 #include <iosfwd>
@@ -75,16 +78,80 @@ class logger_registry;
 /// The output format is: (depending on level)
 /// DEBUG  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n
 ///
+/// It is possible to rate-limit log messages, see \ref logger::rate_limit.
 class logger {
     sstring _name;
     std::atomic<log_level> _level = { log_level::info };
     static std::ostream* _out;
     static std::atomic<bool> _ostream;
     static std::atomic<bool> _syslog;
+
+public:
+    class log_writer {
+    public:
+        virtual ~log_writer() = default;
+        virtual internal::log_buf::inserter_iterator operator()(internal::log_buf::inserter_iterator) = 0;
+    };
+    template <typename Func>
+    SEASTAR_CONCEPT(requires requires (Func fn, internal::log_buf::inserter_iterator it) {
+        it = fn(it);
+    })
+    class lambda_log_writer : public log_writer {
+        Func _func;
+    public:
+        lambda_log_writer(Func&& func) : _func(std::forward<Func>(func)) { }
+        virtual ~lambda_log_writer() override = default;
+        virtual internal::log_buf::inserter_iterator operator()(internal::log_buf::inserter_iterator it) override { return _func(it); }
+    };
+
 private:
 
-    void do_log(log_level level, const char* fmt, fmt::format_args args);
+    // We can't use an std::function<> as it potentially allocates.
+    void do_log(log_level level, log_writer& writer);
     void failed_to_log(std::exception_ptr ex) noexcept;
+public:
+    /// Apply a rate limit to log message(s)
+    ///
+    /// Pass this to \ref logger::log() to apply a rate limit to the message.
+    /// The rate limit is applied to all \ref logger::log() calls this rate
+    /// limit is passed to. Example:
+    ///
+    ///     void handle_request() {
+    ///         static thread_local logger::rate_limit my_rl(std::chrono::seconds(10));
+    ///         // ...
+    ///         my_log.log(log_level::info, my_rl, "a message we don't want to log on every request, only at most once each 10 seconds");
+    ///         // ...
+    ///     }
+    ///
+    /// The rate limit ensures that at most one message per interval will be
+    /// logged. If there were messages dropped due to rate-limiting the
+    /// following snippet will be prepended to the first non-dropped log
+    /// messages:
+    ///
+    ///     (rate limiting dropped $N similar messages)
+    ///
+    /// Where $N is the number of messages dropped.
+    class rate_limit {
+        friend class logger;
+
+        using clock = lowres_clock;
+
+    private:
+        clock::duration _interval;
+        clock::time_point _next;
+        uint64_t _dropped_messages = 0;
+
+    private:
+        bool check();
+        bool has_dropped_messages() const { return bool(_dropped_messages); }
+        uint64_t get_and_reset_dropped_messages() {
+            return std::exchange(_dropped_messages, 0);
+        }
+
+    public:
+        explicit rate_limit(std::chrono::milliseconds interval);
+    };
+
 public:
     explicit logger(sstring name);
     logger(logger&& x);
@@ -109,12 +176,89 @@ public:
     void log(log_level level, const char* fmt, Args&&... args) noexcept {
         if (is_enabled(level)) {
             try {
-                do_log(level, fmt, fmt::make_format_args(std::forward<Args>(args)...));
+                lambda_log_writer writer([&] (internal::log_buf::inserter_iterator it) {
+                    return fmt::format_to(it, fmt, std::forward<Args>(args)...);
+                });
+                do_log(level, writer);
             } catch (...) {
                 failed_to_log(std::current_exception());
             }
         }
     }
+
+    /// logs with a rate limit to desired level if enabled, otherwise we ignore the log line
+    ///
+    /// If there were messages dropped due to rate-limiting the following snippet
+    /// will be prepended to the first non-dropped log messages:
+    ///
+    ///     (rate limiting dropped $N similar messages)
+    ///
+    /// Where $N is the number of messages dropped.
+    ///
+    /// \param rl - the \ref rate_limit to apply to this log
+    /// \param fmt - {fmt} style format
+    /// \param args - args to print string
+    ///
+    template <typename... Args>
+    void log(log_level level, rate_limit& rl, const char* fmt, Args&&... args) noexcept {
+        if (is_enabled(level) && rl.check()) {
+            try {
+                lambda_log_writer writer([&] (internal::log_buf::inserter_iterator it) {
+                    if (rl.has_dropped_messages()) {
+                        it = fmt::format_to(it, "(rate limiting dropped {} similar messages) ", rl.get_and_reset_dropped_messages());
+                    }
+                    return fmt::format_to(it, fmt, std::forward<Args>(args)...);
+                });
+                do_log(level, writer);
+            } catch (...) {
+                failed_to_log(std::current_exception());
+            }
+        }
+    }
+
+    /// \cond internal
+    /// logs to desired level if enabled, otherwise we ignore the log line
+    ///
+    /// \param writer a function which writes directly to the underlying log buffer
+    ///
+    /// This is a low level method for use cases where it is very important to
+    /// avoid any allocations. The \arg writer will be passed a
+    /// internal::log_buf::inserter_iterator that allows it to write into the log
+    /// buffer directly, avoiding the use of any intermediary buffers.
+    void log(log_level level, log_writer& writer) noexcept {
+        if (is_enabled(level)) {
+            try {
+                do_log(level, writer);
+            } catch (...) {
+                failed_to_log(std::current_exception());
+            }
+        }
+    }
+    /// logs to desired level if enabled, otherwise we ignore the log line
+    ///
+    /// \param writer a function which writes directly to the underlying log buffer
+    ///
+    /// This is a low level method for use cases where it is very important to
+    /// avoid any allocations. The \arg writer will be passed a
+    /// internal::log_buf::inserter_iterator that allows it to write into the log
+    /// buffer directly, avoiding the use of any intermediary buffers.
+    /// This is rate-limited version, see \ref rate_limit.
+    void log(log_level level, rate_limit& rl, log_writer& writer) noexcept {
+        if (is_enabled(level) && rl.check()) {
+            try {
+                lambda_log_writer writer_wrapper([&] (internal::log_buf::inserter_iterator it) {
+                    if (rl.has_dropped_messages()) {
+                        it = fmt::format_to(it, "(rate limiting dropped {} similar messages) ", rl.get_and_reset_dropped_messages());
+                    }
+                    return writer(it);
+                });
+                do_log(level, writer_wrapper);
+            } catch (...) {
+                failed_to_log(std::current_exception());
+            }
+        }
+    }
+    /// \endcond
 
     /// Log with error tag:
     /// ERROR  %Y-%m-%d %T,%03d [shard 0] - "your msg" \n

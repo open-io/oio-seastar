@@ -21,6 +21,7 @@
 
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/testing/test_runner.hh>
 
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
@@ -30,7 +31,9 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/stall_sampler.hh>
 #include <seastar/core/aligned_buffer.hh>
+#include <seastar/core/io_intent.hh>
 #include <seastar/util/tmp_file.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 
 #include <boost/range/adaptor/transformed.hpp>
 #include <iostream>
@@ -674,5 +677,161 @@ SEASTAR_TEST_CASE(test_nowait_flag_correctness) {
             f.dma_write(i * 4096, wb, 4096).get();
             f.flush().get0();
         }
+    });
+}
+
+SEASTAR_TEST_CASE(test_destruct_just_constructed_append_challenged_file) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto oflags = open_flags::rw | open_flags::create;
+        auto f = open_file_dma(filename, oflags).get0();
+    });
+}
+
+SEASTAR_TEST_CASE(test_destruct_just_constructed_append_challenged_file_with_sloppy_size) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto oflags = open_flags::rw | open_flags::create;
+        file_open_options opt;
+        opt.sloppy_size = true;
+        auto f = open_file_dma(filename, oflags, opt).get0();
+    });
+}
+
+SEASTAR_TEST_CASE(test_destruct_append_challenged_file_after_write) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto buf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+        std::fill(buf.get(), buf.get() + 4096, 0);
+
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get0();
+        f.dma_write(0, buf.get(), 4096).get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_destruct_append_challenged_file_after_read) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto buf = allocate_aligned_buffer<unsigned char>(4096, 4096);
+        std::fill(buf.get(), buf.get() + 4096, 0);
+
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get0();
+        f.dma_write(0, buf.get(), 4096).get();
+        f.flush().get0();
+        f.close().get();
+
+        f = open_file_dma(filename, open_flags::rw).get0();
+        f.dma_read(0, buf.get(), 4096).get();
+    });
+}
+
+SEASTAR_TEST_CASE(test_dma_iovec) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        static constexpr size_t alignment = 4096;
+        auto wbuf = allocate_aligned_buffer<char>(alignment, alignment);
+        size_t size = 1234;
+        std::fill_n(wbuf.get(), alignment, char(0));
+        std::fill_n(wbuf.get(), size, char(42));
+        std::vector<iovec> iovecs;
+
+        auto filename = (t.get_path() / "testfile.tmp").native();
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get0();
+        iovecs.push_back(iovec{ wbuf.get(), alignment });
+        auto count = f.dma_write(0, iovecs).get0();
+        BOOST_REQUIRE_EQUAL(count, alignment);
+        f.truncate(size).get();
+        f.close().get();
+
+        auto rbuf = allocate_aligned_buffer<char>(alignment, alignment);
+
+        // this tests the posix_file_impl
+        f = open_file_dma(filename, open_flags::ro).get0();
+        std::fill_n(rbuf.get(), alignment, char(0));
+        iovecs.clear();
+        iovecs.push_back(iovec{ rbuf.get(), alignment });
+        count = f.dma_read(0, iovecs).get0();
+        BOOST_REQUIRE_EQUAL(count, size);
+
+        BOOST_REQUIRE(std::equal(wbuf.get(), wbuf.get() + alignment, rbuf.get(), rbuf.get() + alignment));
+
+        // this tests the append_challenged_posix_file_impl
+        f = open_file_dma(filename, open_flags::rw).get0();
+        std::fill_n(rbuf.get(), alignment, char(0));
+        iovecs.clear();
+        iovecs.push_back(iovec{ rbuf.get(), alignment });
+        count = f.dma_read(0, iovecs).get0();
+        BOOST_REQUIRE_EQUAL(count, size);
+
+        BOOST_REQUIRE(std::equal(wbuf.get(), wbuf.get() + alignment, rbuf.get(), rbuf.get() + alignment));
+    });
+}
+
+SEASTAR_TEST_CASE(test_intent) {
+    return tmp_dir::do_with_thread([] (tmp_dir& t) {
+        sstring filename = (t.get_path() / "testfile.tmp").native();
+        auto f = open_file_dma(filename, open_flags::rw | open_flags::create).get0();
+        auto buf = allocate_aligned_buffer<unsigned char>(1024, 1024);
+        std::fill(buf.get(), buf.get() + 1024, 'a');
+        f.dma_write(0, buf.get(), 1024).get();
+        std::fill(buf.get(), buf.get() + 1024, 'b');
+        io_intent intent;
+        auto f1 = f.dma_write(0, buf.get(), 512);
+        auto f2 = f.dma_write(512, buf.get(), 512, default_priority_class(), &intent);
+        intent.cancel();
+
+        bool cancelled = false;
+        f1.get();
+        try {
+            f2.get();
+        } catch (cancelled_error& ex) {
+            cancelled = true;
+        }
+        auto rbuf = allocate_aligned_buffer<unsigned char>(1024, 1024);
+        f.dma_read(0, rbuf.get(), 1024).get();
+        BOOST_REQUIRE(rbuf.get()[0] == 'b');
+        if (cancelled) {
+            BOOST_REQUIRE(rbuf.get()[512] == 'a');
+        } else {
+            // The file::dma_write doesn't preemt, but if it
+            // suddenly will, the 2nd write will pass before
+            // the intent would be cancelled
+            BOOST_TEST_WARN(0, "Write won the race with cancellation");
+            BOOST_REQUIRE(rbuf.get()[512] == 'b');
+        }
+    });
+}
+
+SEASTAR_TEST_CASE(parallel_overwrite) {
+    // Avoid /tmp for tmp_dir, since it can be tmpfs
+    return tmp_dir::do_with("XXXXXXXX.tmp", [] (tmp_dir& t) {
+        return async([&] {
+            // Check that overwrites at disk_overwrite_dma_alignment() do not cause stalls. First,
+            // create a file.
+            auto fname = (t.get_path() / "testfile.tmp").native();
+            auto sz = uint64_t(1*1024*1024);
+            auto buffer_size = 128*1024;
+
+            file f = open_file_dma(fname, open_flags::rw | open_flags::create | open_flags::truncate).get0();
+            // Avoid filesystem problems with size-extending operations
+            f.truncate(sz).get();
+            auto buf = allocate_aligned_buffer<unsigned char>(buffer_size, f.memory_dma_alignment());
+            for (uint64_t offset = 0; offset < sz; offset += buffer_size) {
+                f.dma_write(offset, buf.get(), buffer_size).get();
+            }
+
+            auto random_engine = testing::local_random_engine;
+            auto dist = std::uniform_int_distribution(uint64_t(0), sz-1);
+            auto offsets  = std::vector<uint64_t>();
+            std::generate_n(std::back_insert_iterator(offsets), 5000, [&] { return align_down(dist(random_engine), f.disk_overwrite_dma_alignment()); });
+            auto stall_report = internal::report_reactor_stalls([&] {
+                return max_concurrent_for_each(offsets, 10, [&] (uint64_t offset) {
+                    return f.dma_write(offset, buf.get(), f.disk_overwrite_dma_alignment()).discard_result();
+                });
+            }).get0();
+            std::cout << "parallel_overwrite: " << stall_report << " (overwrite dma alignment " << f.disk_overwrite_dma_alignment() << ")\n";
+
+            f.close().get();
+            remove_file(fname).get();
+        });
     });
 }

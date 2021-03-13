@@ -68,7 +68,7 @@ class Addr2Line:
         return self._read_resolved_address()
 
 class BacktraceResolver(object):
-    object_address_re = re.compile('^(.*?)\W(((/[^/]+)+)\+)?(0x[0-9a-f]+)\W*$')
+    object_address_re = re.compile('^(?:(\w*)\W+)?(((/[^/]+)+)\+)?(0x[0-9a-f]+)\W*$', flags=re.IGNORECASE)
     separator_re = re.compile('^\W*-+\W*$')
 
     def __init__(self, executable, before_lines, context_re, verbose):
@@ -234,7 +234,7 @@ cmdline_parser.add_argument(
         required=False,
         metavar='FILE',
         dest='file',
-        help='The file containing the addresses (one per line)')
+        help='The file containing the addresses')
 
 cmdline_parser.add_argument(
         '-b',
@@ -288,5 +288,8 @@ else:
         lines = sys.stdin
 
 with BacktraceResolver(args.executable, args.before, args.match, args.verbose) as resolve:
+    p = re.compile(r'\W+')
     for line in lines:
-        resolve(line)
+        tokens = re.split(p, line.strip())
+        for t in tokens:
+            resolve(t)

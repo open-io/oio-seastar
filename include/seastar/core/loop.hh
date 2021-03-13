@@ -119,7 +119,7 @@ future<> repeat(AsyncAction&& action) noexcept {
 
         if (!f.available() || f.failed() || need_preempt()) {
             return [&] () noexcept {
-                memory::disable_failure_guard dfg;
+                memory::scoped_critical_alloc_section _;
                 auto repeater = new internal::repeater<AsyncAction>(std::move(action));
                 auto ret = repeater->get_future();
                 internal::set_callback(f, repeater);
@@ -237,7 +237,7 @@ repeat_until_value(AsyncAction action) noexcept {
 
         if (!f.available()) {
           return [&] () noexcept {
-            memory::disable_failure_guard dfg;
+            memory::scoped_critical_alloc_section _;
             auto state = new internal::repeat_until_value_state<AsyncAction, value_type>(std::move(action));
             auto ret = state->get_future();
             internal::set_callback(f, state);
@@ -314,32 +314,37 @@ public:
 
 } // namespace internal
 
-/// Invokes given action until it fails or given condition evaluates to true.
+/// Invokes given action until it fails or given condition evaluates to true or fails.
 ///
 /// \param stop_cond a callable taking no arguments, returning a boolean that
 ///                  evalutes to true when you don't want to call \c action
-///                  any longer
+///                  any longer. If \c stop_cond fails, the exception is propagated
+//                   in the returned future.
 /// \param action a callable taking no arguments, returning a future<>.  Will
 ///               be called again as soon as the future resolves, unless the
-///               future fails, or \c stop_cond returns \c true.
+///               future fails, or \c stop_cond returns \c true or fails.
 /// \return a ready future if we stopped successfully, or a failed future if
-///         a call to to \c action failed.
+///         a call to to \c action or a call to \c stop_cond failed.
 template<typename AsyncAction, typename StopCondition>
 SEASTAR_CONCEPT( requires seastar::InvokeReturns<StopCondition, bool> && seastar::InvokeReturns<AsyncAction, future<>> )
 inline
 future<> do_until(StopCondition stop_cond, AsyncAction action) noexcept {
     using namespace internal;
     for (;;) {
+      try {
         if (stop_cond()) {
             return make_ready_future<>();
         }
+      } catch (...) {
+        return current_exception_as_future();
+      }
         auto f = futurize_invoke(action);
         if (f.failed()) {
             return f;
         }
         if (!f.available() || need_preempt()) {
             return [&] () noexcept {
-                memory::disable_failure_guard dfg;
+                memory::scoped_critical_alloc_section _;
                 auto task = new do_until_state<StopCondition, AsyncAction>(std::move(stop_cond), std::move(action));
                 auto ret = task->get_future();
                 internal::set_callback(f, task);
@@ -549,7 +554,7 @@ parallel_for_each(Iterator begin, Iterator end, Func&& func) noexcept {
         auto f = futurize_invoke(std::forward<Func>(func), *begin++);
         if (!f.available() || f.failed()) {
             if (!s) {
-                memory::disable_failure_guard dfg;
+                memory::scoped_critical_alloc_section _;
                 using itraits = std::iterator_traits<Iterator>;
                 auto n = (internal::iterator_range_estimate_vector_capacity(begin, end, typename itraits::iterator_category()) + 1);
                 s = new parallel_for_each_state(n);

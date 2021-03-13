@@ -60,6 +60,15 @@ future<int> failing_coroutine() {
     throw 42;
 }
 
+[[gnu::noinline]] int throw_exception(int x) {
+    throw x;
+}
+
+future<int> failing_coroutine2() noexcept {
+    co_await later();
+    co_return throw_exception(17);
+}
+
 }
 
 SEASTAR_TEST_CASE(test_simple_coroutines) {
@@ -68,32 +77,23 @@ SEASTAR_TEST_CASE(test_simple_coroutines) {
     BOOST_REQUIRE_EQUAL(ready_coroutine().get0(), 64);
     BOOST_REQUIRE(co_await tuple_coroutine() == std::tuple(1, 2.));
     BOOST_REQUIRE_EXCEPTION((void)co_await failing_coroutine(), int, [] (auto v) { return v == 42; });
-}
-
-
-future<> forwarding_return_coroutine_1(bool& x) {
-    co_return
-// Clang complains if both return_value and return_void are defined
-#if defined(__clang__)
-    co_await
-#endif
-      later().then([&x] {
-        x = true;
-    });
-}
-
-future<int> forwarding_return_coroutine_2() {
-    co_return later().then([] {
-        return 3;
-    });
-}
-
-SEASTAR_TEST_CASE(test_forwarding_return) {
-    bool x = false;
-    co_await forwarding_return_coroutine_1(x);
-    BOOST_REQUIRE(x);
-    auto y = co_await forwarding_return_coroutine_2();
-    BOOST_REQUIRE_EQUAL(y, 3);
+    BOOST_CHECK_EQUAL(co_await failing_coroutine().then_wrapped([] (future<int> f) -> future<int> {
+        BOOST_REQUIRE(f.failed());
+        try {
+            std::rethrow_exception(f.get_exception());
+        } catch (int v) {
+           co_return v;
+        }
+    }), 42);
+    BOOST_REQUIRE_EXCEPTION((void)co_await failing_coroutine2(), int, [] (auto v) { return v == 17; });
+    BOOST_CHECK_EQUAL(co_await failing_coroutine2().then_wrapped([] (future<int> f) -> future<int> {
+        BOOST_REQUIRE(f.failed());
+        try {
+            std::rethrow_exception(f.get_exception());
+        } catch (int v) {
+           co_return v;
+        }
+    }), 17);
 }
 
 SEASTAR_TEST_CASE(test_abandond_coroutine) {
@@ -150,4 +150,24 @@ SEASTAR_TEST_CASE(test_scheduling_group) {
     BOOST_REQUIRE(current_scheduling_group() == default_scheduling_group());
 }
 
+SEASTAR_TEST_CASE(test_preemption) {
+    bool x = false;
+    unsigned preempted = 0;
+    auto f = later().then([&x] {
+            x = true;
+        });
+
+    // try to preempt 1000 times. 1 should be enough if not for
+    // task queue shaffling in debug mode which may cause co-routine
+    // continuation to run first.
+    while(preempted < 1000 && !x) {
+        preempted += need_preempt(); 
+        co_await make_ready_future<>();
+    }
+    auto save_x = x;
+    // wait for later() to complete
+    co_await std::move(f);
+    BOOST_REQUIRE(save_x);
+    co_return;
+}
 #endif

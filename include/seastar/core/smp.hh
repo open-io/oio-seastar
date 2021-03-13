@@ -67,6 +67,11 @@ struct smp_service_group_config {
     ///
     /// Will be adjusted upwards to allow at least one request per non-local shard.
     unsigned max_nonlocal_requests = 0;
+    /// An optional name for this smp group
+    ///
+    /// If this optional is engaged, timeout exception messages of the group's
+    /// semaphores will indicate the group's name.
+    std::optional<sstring> group_name;
 };
 
 /// A resource controller for cross-shard calls.
@@ -252,7 +257,7 @@ public:
     ~smp_message_queue();
     template <typename Func>
     futurize_t<std::result_of_t<Func()>> submit(shard_id t, smp_submit_to_options options, Func&& func) noexcept {
-        memory::disable_failure_guard dfg;
+        memory::scoped_critical_alloc_section _;
         auto wi = std::make_unique<async_work_item<Func>>(*this, options.service_group, std::forward<Func>(func));
         auto fut = wi->get_future();
         submit_item(t, options.timeout, std::move(wi));

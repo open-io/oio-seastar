@@ -55,9 +55,6 @@ using namespace boost::accumulators;
 
 static auto random_seed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 static std::default_random_engine random_generator(random_seed);
-// size of each individual file. Every class will have its file, so in a normal system with many shards, we'll naturally have many files and
-// that will push the data out of the disk's cache. And static sizes per file are simpler.
-static constexpr uint64_t file_data_size = 1ull << 30;
 
 class context;
 enum class request_type { seqread, seqwrite, randread, randwrite, append, cpu };
@@ -114,6 +111,10 @@ struct job_config {
     shard_config shard_placement;
     ::shard_info shard_info;
     ::options options;
+    // size of each individual file. Every class and every shard have its file, so in a normal
+    // system with many shards we'll naturally have many files and that will push the data out
+    // of the disk's cache
+    uint64_t file_size;
     std::unique_ptr<class_data> gen_class_data();
 };
 
@@ -135,6 +136,7 @@ protected:
 
     std::chrono::steady_clock::time_point _start = {};
     accumulator_type _latencies;
+    uint64_t _requests = 0;
     std::uniform_int_distribution<uint32_t> _pos_distribution;
     file _file;
 
@@ -148,7 +150,7 @@ public:
         , _iop(engine().register_one_priority_class(format("test-class-{:d}", idgen()), _config.shard_info.shares))
         , _sg(cfg.shard_info.scheduling_group)
         , _latencies(extended_p_square_probabilities = quantiles)
-        , _pos_distribution(0,  file_data_size / _config.shard_info.request_size)
+        , _pos_distribution(0,  _config.file_size / _config.shard_info.request_size)
     {}
 
     virtual ~class_data() = default;
@@ -202,6 +204,11 @@ public:
         }
         return make_ready_future<>();
     }
+
+    const sstring name() const {
+        return _config.name;
+    }
+
 protected:
     sstring type_str() const {
         return std::unordered_map<request_type, sstring>{
@@ -212,10 +219,6 @@ protected:
             { request_type::append , "APPEND" },
             { request_type::cpu , "CPU" },
         }[_config.type];;
-    }
-
-   const sstring name() const {
-        return _config.name;
     }
 
     request_type req_type() const {
@@ -246,6 +249,10 @@ protected:
         return _total_duration;
     }
 
+    uint64_t file_size_mb() const {
+        return _config.file_size >> 20;
+    }
+
     uint64_t total_data() const {
         return _data;
     }
@@ -262,6 +269,10 @@ protected:
         return quantile(_latencies, quantile_probability = q);
     }
 
+    uint64_t requests() const noexcept {
+        return _requests;
+    }
+
     bool is_sequential() const {
         return (req_type() == request_type::seqread) || (req_type() == request_type::seqwrite);
     }
@@ -275,7 +286,7 @@ protected:
             pos = _pos_distribution(random_generator) * req_size();
         } else {
             pos = _last_pos + req_size();
-            if (is_sequential() && (pos >= file_data_size)) {
+            if (is_sequential() && (pos >= _config.file_size)) {
                 pos = 0;
             }
         }
@@ -286,11 +297,11 @@ protected:
     void add_result(size_t data, std::chrono::microseconds latency) {
         _data += data;
         _latencies(latency.count());
+        _requests++;
     }
 
 public:
-    virtual sstring describe_class() = 0;
-    virtual sstring describe_results() = 0;
+    virtual void emit_results(YAML::Emitter& out) = 0;
 };
 
 class io_class_data : public class_data {
@@ -309,7 +320,7 @@ public:
         }).then([this, fname] {
             return do_with(seastar::semaphore(64), [this] (auto& write_parallelism) mutable {
                 auto bufsize = 256ul << 10;
-                auto pos = boost::irange(0ul, (file_data_size / bufsize) + 1);
+                auto pos = boost::irange(0ul, (_config.file_size / bufsize) + 1);
                 return parallel_for_each(pos.begin(), pos.end(), [this, bufsize, &write_parallelism] (auto pos) mutable {
                     return get_units(write_parallelism, 1).then([this, bufsize, pos] (auto perm) mutable {
                         auto bufptr = allocate_aligned_buffer<char>(bufsize, 4096);
@@ -330,20 +341,19 @@ public:
         });
     }
 
-    virtual sstring describe_class() override {
-        return fmt::format("{}: {} shares, {}-byte {}, {} concurrent requests, {}", name(), shares(), req_size(), type_str(), parallelism(), think_time());
-    }
-
-    virtual sstring describe_results() override {
+    virtual void emit_results(YAML::Emitter& out) override {
         auto throughput_kbs = (total_data() >> 10) / total_duration().count();
-        sstring result;
-        result += fmt::format("  Throughput         : {:>8} KB/s\n", throughput_kbs);
-        result += fmt::format("  Lat average        : {:>8} usec\n", average_latency());
+        auto iops = requests() / total_duration().count();
+        out << YAML::Key << "throughput" << YAML::Value << throughput_kbs << YAML::Comment("kB/s");
+        out << YAML::Key << "IOPS" << YAML::Value << iops;
+        out << YAML::Key << "latencies" << YAML::Comment("usec");
+        out << YAML::BeginMap;
+        out << YAML::Key << "average" << YAML::Value << average_latency();
         for (auto& q: quantiles) {
-            result += fmt::format("  Lat quantile={:>5} : {:>8} usec\n", q, quantile_latency(q));
+            out << YAML::Key << fmt::format("p{}", q) << YAML::Value << quantile_latency(q);
         }
-        result += fmt::format("  Lat max            : {:>8} usec\n", max_latency());
-        return result;
+        out << YAML::Key << "max" << YAML::Value << max_latency();
+        out << YAML::EndMap;
     }
 };
 
@@ -383,14 +393,9 @@ public:
         return make_ready_future<size_t>(1);
     }
 
-    virtual sstring describe_class() override {
-        auto exec = std::chrono::duration_cast<std::chrono::microseconds>(_config.shard_info.execution_time);
-        return fmt::format("{}: {} shares, {} us CPU execution time, {} concurrent requests, {}", name(), shares(), exec.count(), parallelism(), think_time());
-    }
-
-    virtual sstring describe_results() override {
+    virtual void emit_results(YAML::Emitter& out) override {
         auto throughput = total_data() / total_duration().count();
-        return fmt::format("  Throughput         : {:>8} continuations/s\n", throughput);
+        out << YAML::Key << "throughput" << YAML::Value << throughput;
     }
 };
 
@@ -526,6 +531,14 @@ struct convert<job_config> {
         cl.name = node["name"].as<std::string>();
         cl.type = node["type"].as<request_type>();
         cl.shard_placement = node["shards"].as<shard_config>();
+        // The data_size is used to divide the available (and effectively
+        // constant) disk space between workloads. Each shard inside the
+        // workload thus uses its portion of the assigned space.
+        if (node["data_size"]) {
+            cl.file_size = node["data_size"].as<byte_size>().size / smp::count;
+        } else {
+            cl.file_size = 1ull << 30; // 1G by default
+        }
         if (node["shard_info"]) {
             cl.shard_info = node["shard_info"].as<shard_info>();
         }
@@ -577,13 +590,13 @@ public:
         });
     }
 
-    future<> print_stats() {
-        return _finished.wait(_cl.size()).then([this] {
-            fmt::print("Shard {:>2}\n", this_shard_id());
-            auto idx = 0;
+    future<> emit_results(YAML::Emitter& out) {
+        return _finished.wait(_cl.size()).then([this, &out] {
             for (auto& cl: _cl) {
-                fmt::print("Class {:>2} ({})\n", idx++, cl->describe_class());
-                fmt::print("{}\n", cl->describe_results());
+                out << YAML::Key << cl->name();
+                out << YAML::BeginMap;
+                cl->emit_results(out);
+                out << YAML::EndMap;
             }
             return make_ready_future<>();
         });
@@ -593,6 +606,23 @@ public:
 int class_data::idgen() {
     static thread_local int id = 0;
     return id++;
+}
+
+static void show_results(distributed<context>& ctx) {
+    YAML::Emitter out;
+    out << YAML::BeginDoc;
+    out << YAML::BeginSeq;
+    for (unsigned i = 0; i < smp::count; ++i) {
+        out << YAML::BeginMap;
+        out << YAML::Key << "shard" << YAML::Value << i;
+        ctx.invoke_on(i, [&out] (auto& c) {
+            return c.emit_results(out);
+        }).get();
+        out << YAML::EndMap;
+    }
+    out << YAML::EndSeq;
+    out << YAML::EndDoc;
+    std::cout << out.c_str();
 }
 
 int main(int ac, char** av) {
@@ -640,11 +670,7 @@ int main(int ac, char** av) {
             ctx.invoke_on_all([] (auto& c) {
                 return c.issue_requests();
             }).get();
-            for (unsigned i = 0; i < smp::count; ++i) {
-                ctx.invoke_on(i, [] (auto& c) {
-                    return c.print_stats();
-                }).get();
-            }
+            show_results(ctx);
             ctx.stop().get0();
         }).or_terminate();
     });

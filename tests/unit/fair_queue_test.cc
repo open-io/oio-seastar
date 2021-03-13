@@ -37,17 +37,25 @@ using namespace seastar;
 using namespace std::chrono_literals;
 
 struct request {
-    fair_queue_ticket fqdesc;
+    fair_queue_entry fqent;
+    std::function<void(request& req)> handle;
     unsigned index;
 
-    request(unsigned weight, unsigned index)
-        : fqdesc({weight, 0})
+    template <typename Func>
+    request(unsigned weight, unsigned index, Func&& h)
+        : fqent(fair_queue_ticket(weight, 0))
+        , handle(std::move(h))
         , index(index)
     {}
+
+    void submit() {
+        handle(*this);
+        delete this;
+    }
 };
 
-
 class test_env {
+    fair_group _fg;
     fair_queue _fq;
     std::vector<int> _results;
     std::vector<std::vector<std::exception_ptr>> _exceptions;
@@ -58,7 +66,9 @@ class test_env {
         do {} while (tick() != 0);
     }
 public:
-    test_env(unsigned capacity) : _fq(capacity)
+    test_env(unsigned capacity)
+        : _fg(fair_group::config(capacity, std::numeric_limits<int>::max()))
+        , _fq(_fg, fair_queue::config())
     {}
 
     // As long as there is a request sitting in the queue, tick() will process
@@ -70,7 +80,9 @@ public:
     // before the queue is destroyed.
     unsigned tick(unsigned n = 1) {
         unsigned processed = 0;
-        _fq.dispatch_requests();
+        _fq.dispatch_requests([] (fair_queue_entry& ent) {
+            boost::intrusive::get_parent_from_member(&ent, &request::fqent)->submit();
+        });
 
         for (unsigned i = 0; i < n; ++i) {
             std::vector<request> curr;
@@ -79,10 +91,12 @@ public:
             for (auto& req : curr) {
                 processed++;
                 _results[req.index]++;
-                _fq.notify_requests_finished(req.fqdesc);
+                _fq.notify_requests_finished(req.fqent.ticket());
             }
 
-            _fq.dispatch_requests();
+            _fq.dispatch_requests([] (fair_queue_entry& ent) {
+                boost::intrusive::get_parent_from_member(&ent, &request::fqent)->submit();
+            });
         }
         return processed;
     }
@@ -103,17 +117,18 @@ public:
 
     void do_op(unsigned index, unsigned weight) {
         auto cl = _classes[index];
-        auto req = request(weight, index);
-
-        _fq.queue(cl, req.fqdesc, [this, index, req] () mutable noexcept {
+        auto req = std::make_unique<request>(weight, index, [this, index] (request& req) mutable noexcept {
             try {
                 _inflight.push_back(std::move(req));
             } catch (...) {
                 auto eptr = std::current_exception();
                 _exceptions[index].push_back(eptr);
-                _fq.notify_requests_finished(req.fqdesc);
+                _fq.notify_requests_finished(req.fqent.ticket());
             }
         });
+
+        _fq.queue(cl, req->fqent);
+        req.release();
     }
 
     void update_shares(unsigned index, uint32_t shares) {

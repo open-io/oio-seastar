@@ -459,6 +459,19 @@ SEASTAR_TEST_CASE(test_exception_can_be_thrown_from_do_until_body) {
     });
 }
 
+SEASTAR_TEST_CASE(test_exception_can_be_thrown_from_do_until_condition) {
+    return do_until([] { throw expected_exception(); return false; }, [] {
+        return now();
+    }).then_wrapped([] (auto&& f) {
+       try {
+           f.get();
+           BOOST_FAIL("should have failed");
+       } catch (const expected_exception& e) {
+           // expected
+       }
+    });
+}
+
 SEASTAR_TEST_CASE(test_bare_value_can_be_returned_from_callback) {
     return now().then([] {
         return 3;
@@ -492,6 +505,31 @@ SEASTAR_TEST_CASE(test_map_reduce) {
             square, long(0), std::plus<long>()).then([n] (auto result) {
         auto m = n - 1; // counting does not include upper bound
         BOOST_REQUIRE_EQUAL(result, (m * (m + 1) * (2*m + 1)) / 6);
+    });
+}
+
+SEASTAR_TEST_CASE(test_map_reduce_simple) {
+    return do_with(0L, [] (auto& res) {
+        long n = 10;
+        return map_reduce(boost::make_counting_iterator<long>(0), boost::make_counting_iterator<long>(n),
+                [] (long x) { return x; },
+                [&res] (long x) { res += x; }).then([n, &res] {
+            long expected = (n * (n - 1)) / 2;
+            BOOST_REQUIRE_EQUAL(res, expected);
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_map_reduce_tuple) {
+    return do_with(0L, 0L, [] (auto& res0, auto& res1) {
+        long n = 10;
+        return map_reduce(boost::make_counting_iterator<long>(0), boost::make_counting_iterator<long>(n),
+                [] (long x) { return std::tuple<long, long>(x, -x); },
+                [&res0, &res1] (std::tuple<long, long> t) { res0 += std::get<0>(t); res1 += std::get<1>(t); }).then([n, &res0, &res1] {
+            long expected = (n * (n - 1)) / 2;
+            BOOST_REQUIRE_EQUAL(res0, expected);
+            BOOST_REQUIRE_EQUAL(res1, -expected);
+        });
     });
 }
 
@@ -1589,4 +1627,17 @@ SEASTAR_THREAD_TEST_CASE(test_max_concurrent_for_each) {
         return make_ready_future<>();
     }).get();
     BOOST_REQUIRE_EQUAL(sum, 28);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_for_each_set) {
+    std::bitset<32> s;
+    s.set(4);
+    s.set(0);
+
+    auto range = bitsets::for_each_set(s);
+    unsigned res = 0;
+    do_for_each(range, [&res] (auto i) {
+        res |= 1 << i;
+    }).get();
+    BOOST_REQUIRE_EQUAL(res, 17);
 }

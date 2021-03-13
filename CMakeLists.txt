@@ -43,6 +43,7 @@ project (Seastar
 # generic boolean values passed as string, potentially from configure.py
 set (True_STRING_VALUES "ON" "yes" "Yes" "YES" "true" "True" "TRUE")
 set (False_STRING_VALUES "OFF" "no" "No" "NO" "false" "False" "FALSE")
+set (Default_STRING_VALUES "DEFAULT" "default" "Default")
 
 set (Seastar_ALLOC_FAILURE_INJECTION
   "DEFAULT"
@@ -174,6 +175,12 @@ set (Seastar_CXX_DIALECT
   CACHE
   STRING
   "Compile Seastar according to the named C++ standard.")
+if (Seastar_CXX_DIALECT)
+  # extract CXX standard (14/17/...) from Seastar_CXX_DIALECT
+  string(SUBSTRING ${Seastar_CXX_DIALECT} 5 2 STANDARD)
+  set(CMAKE_CXX_STANDARD ${STANDARD})
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+endif ()
 
 set (Seastar_CXX_FLAGS
   ""
@@ -298,6 +305,12 @@ set (Seastar_SANITIZE
   STRING
   "Enable ASAN and UBSAN. Can be ON, OFF or DEFAULT (which enables it for Debug and Sanitize)")
 
+set (Seastar_DEBUG_SHARED_PTR
+  "DEFAULT"
+  CACHE
+  STRING
+  "Enable shared_ptr debugging. Can be ON, OFF or DEFAULT (which enables it for Debug and Sanitize)")
+
 # When Seastar is embedded with `add_subdirectory`, disable the non-library targets.
 if (NOT (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR))
   set (Seastar_APPS OFF)
@@ -400,6 +413,12 @@ endfunction ()
 #
 
 seastar_generate_ragel (
+  TARGET seastar_http_chunk_parsers
+  VAR http_chunk_parsers_file
+  IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/http/chunk_parsers.rl
+  OUT_FILE ${Seastar_GEN_BINARY_DIR}/include/seastar/http/chunk_parsers.hh)
+
+seastar_generate_ragel (
   TARGET seastar_http_request_parser
   VAR http_request_parser_file
   IN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/src/http/request_parser.rl
@@ -422,6 +441,7 @@ if (Seastar_DPDK)
 endif ()
 
 add_library (seastar STATIC
+  ${http_chunk_parsers_file}
   ${http_request_parser_file}
   ${proto_metrics2_files}
   ${seastar_dpdk_obj}
@@ -533,6 +553,7 @@ add_library (seastar STATIC
   include/seastar/http/reply.hh
   include/seastar/http/request.hh
   include/seastar/http/routes.hh
+  include/seastar/http/short_streams.hh
   include/seastar/http/transformers.hh
   include/seastar/json/formatter.hh
   include/seastar/json/json_elements.hh
@@ -584,6 +605,7 @@ add_library (seastar STATIC
   include/seastar/util/is_smart_ptr.hh
   include/seastar/util/lazy.hh
   include/seastar/util/log-cli.hh
+  include/seastar/util/log-impl.hh
   include/seastar/util/log.hh
   include/seastar/util/noncopyable_function.hh
   include/seastar/util/optimized_optional.hh
@@ -629,6 +651,8 @@ add_library (seastar STATIC
   src/core/uname.cc
   src/core/vla.hh
   src/core/io_queue.cc
+  src/core/semaphore.cc
+  src/core/condition-variable.cc
   src/http/api_docs.cc
   src/http/common.cc
   src/http/file_handler.cc
@@ -638,6 +662,7 @@ add_library (seastar STATIC
   src/http/mime_types.cc
   src/http/reply.cc
   src/http/routes.cc
+  src/http/short_streams.cc
   src/http/transformers.cc
   src/json/formatter.cc
   src/json/json_elements.cc
@@ -679,6 +704,7 @@ add_library (seastar STATIC
 add_library (Seastar::seastar ALIAS seastar)
 
 add_dependencies (seastar
+  seastar_http_chunk_parsers
   seastar_http_request_parser
   seastar_http_response_parser
   seastar_proto_metrics2)
@@ -930,8 +956,16 @@ if ((CMAKE_BUILD_TYPE STREQUAL "Debug") OR (CMAKE_BUILD_TYPE STREQUAL "Sanitize"
     PUBLIC
       SEASTAR_DEBUG
       SEASTAR_DEFAULT_ALLOCATOR
-      SEASTAR_DEBUG_SHARED_PTR
       SEASTAR_SHUFFLE_TASK_QUEUE)
+endif ()
+
+set (Seastar_DEBUG_SHARED_PTR_MODES "Debug" "Sanitize")
+if (Seastar_DEBUG_SHARED_PTR IN_LIST True_STRING_VALUES OR
+    ((Seastar_DEBUG_SHARED_PTR IN_LIST Default_STRING_VALUES) AND
+     (CMAKE_BUILD_TYPE IN_LIST Seastar_DEBUG_SHARED_PTR_MODES)))
+  target_compile_definitions (seastar
+    PUBLIC
+      SEASTAR_DEBUG_SHARED_PTR)
 endif ()
 
 set (Seastar_STACK_GUARD_MODES "Debug" "Sanitize" "Dev")
@@ -980,11 +1014,13 @@ if (Seastar_INSTALL OR Seastar_TESTING)
   add_library (seastar_testing
     include/seastar/testing/entry_point.hh
     include/seastar/testing/exchanger.hh
+    include/seastar/testing/random.hh
     include/seastar/testing/seastar_test.hh
     include/seastar/testing/test_case.hh
     include/seastar/testing/test_runner.hh
     include/seastar/testing/thread_test_case.hh
     src/testing/entry_point.cc
+    src/testing/random.cc
     src/testing/seastar_test.cc
     src/testing/test_runner.cc)
 
@@ -1003,6 +1039,7 @@ if (Seastar_INSTALL OR Seastar_TESTING)
       seastar)
 
   add_library(seastar_perf_testing
+    src/testing/random.cc
     include/seastar/testing/perf_tests.hh
     tests/perf/perf_tests.cc)
   add_library (Seastar::seastar_perf_testing ALIAS seastar_perf_testing)

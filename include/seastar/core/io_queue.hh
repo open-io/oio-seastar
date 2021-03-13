@@ -46,7 +46,10 @@ class io_priority_class;
 future<>
 rename_priority_class(io_priority_class pc, sstring new_name);
 
+class io_intent;
+
 namespace internal {
+class io_sink;
 namespace linux_abi {
 
 struct io_event;
@@ -58,24 +61,35 @@ struct iocb;
 using shard_id = unsigned;
 
 class io_priority_class;
+class io_queue;
+class io_desc_read_write;
+class queued_io_request;
+
+class io_group {
+public:
+    struct config {
+        unsigned max_req_count = std::numeric_limits<int>::max();
+        unsigned max_bytes_count = std::numeric_limits<int>::max();
+    };
+    explicit io_group(config cfg) noexcept;
+
+private:
+    friend class io_queue;
+    fair_group _fg;
+    const unsigned _maximum_request_size;
+
+    static fair_group::config make_fair_group_config(config cfg) noexcept;
+};
+
+using io_group_ptr = std::shared_ptr<io_group>;
+struct priority_class_data;
 
 class io_queue {
 private:
-    struct priority_class_data {
-        priority_class_ptr ptr;
-        size_t bytes;
-        uint64_t ops;
-        uint32_t nr_queued;
-        std::chrono::duration<double> queue_time;
-        metrics::metric_groups _metric_groups;
-        priority_class_data(sstring name, sstring mountpoint, priority_class_ptr ptr, shard_id owner);
-        void rename(sstring new_name, sstring mountpoint, shard_id owner);
-    private:
-        void register_stats(sstring name, sstring mountpoint, shard_id owner);
-    };
-
-    std::vector<std::vector<std::unique_ptr<priority_class_data>>> _priority_classes;
+    std::vector<std::unique_ptr<priority_class_data>> _priority_classes;
+    io_group_ptr _group;
     fair_queue _fq;
+    internal::io_sink& _sink;
 
     static constexpr unsigned _max_classes = 2048;
     static std::mutex _register_lock;
@@ -87,9 +101,7 @@ public:
     static bool rename_one_priority_class(io_priority_class pc, sstring name);
 
 private:
-    priority_class_data& find_or_create_class(const io_priority_class& pc, shard_id owner);
-
-    fair_queue_ticket request_fq_ticket(const internal::io_request& req, size_t len) const;
+    priority_class_data& find_or_create_class(const io_priority_class& pc);
 
     // The fields below are going away, they are just here so we can implement deprecated
     // functions that used to be provided by the fair_queue and are going away (from both
@@ -107,23 +119,29 @@ public:
     // It is also technically possible for reads to be the expensive ones, in which case
     // writes will have an integer value lower than read_request_base_count.
     static constexpr unsigned read_request_base_count = 128;
+    static constexpr unsigned request_ticket_size_shift = 9;
+    static constexpr unsigned minimal_request_size = 512;
 
     struct config {
         dev_t devid;
-        shard_id coordinator;
         unsigned capacity = std::numeric_limits<unsigned>::max();
-        unsigned max_req_count = std::numeric_limits<unsigned>::max();
-        unsigned max_bytes_count = std::numeric_limits<unsigned>::max();
         unsigned disk_req_write_to_read_multiplier = read_request_base_count;
         unsigned disk_bytes_write_to_read_multiplier = read_request_base_count;
+        float disk_us_per_request = 0;
+        float disk_us_per_byte = 0;
         sstring mountpoint = "undefined";
     };
 
-    io_queue(config cfg);
+    io_queue(io_group_ptr group, internal::io_sink& sink, config cfg);
     ~io_queue();
 
+    fair_queue_ticket request_fq_ticket(const internal::io_request& req, size_t len) const;
+
     future<size_t>
-    queue_request(const io_priority_class& pc, size_t len, internal::io_request req) noexcept;
+    queue_request(const io_priority_class& pc, size_t len, internal::io_request req, io_intent* intent) noexcept;
+    void submit_request(io_desc_read_write* desc, internal::io_request req, priority_class_data& pclass) noexcept;
+    void cancel_request(queued_io_request& req, priority_class_data& pclass) noexcept;
+    void complete_cancelled_request(queued_io_request& req) noexcept;
 
     [[deprecated("modern I/O queues should use a property file")]] size_t capacity() const {
         return _config.capacity;
@@ -143,16 +161,14 @@ public:
     void notify_requests_finished(fair_queue_ticket& desc) noexcept;
 
     // Dispatch requests that are pending in the I/O queue
-    void poll_io_queue() {
-        _fq.dispatch_requests();
+    void poll_io_queue();
+
+    std::chrono::steady_clock::time_point next_pending_aio() const noexcept {
+        return _fq.next_pending_aio();
     }
 
     sstring mountpoint() const {
         return _config.mountpoint;
-    }
-
-    shard_id coordinator() const {
-        return _config.coordinator;
     }
 
     dev_t dev_id() const noexcept {

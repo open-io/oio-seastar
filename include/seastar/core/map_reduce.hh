@@ -85,6 +85,12 @@ struct reducer_traits<T, decltype(std::declval<T>().get(), void())> : public red
 
 // TODO: specialize for non-deferring reducer
 template <typename Iterator, typename Mapper, typename Reducer>
+SEASTAR_CONCEPT( requires requires (Iterator i, Mapper mapper, Reducer reduce) {
+     *i++;
+     { i != i } -> std::convertible_to<bool>;
+     mapper(*i);
+     reduce(futurize_invoke(mapper, *i).get0());
+} )
 inline
 auto
 map_reduce(Iterator begin, Iterator end, Mapper&& mapper, Reducer&& r)
@@ -99,7 +105,7 @@ map_reduce(Iterator begin, Iterator end, Mapper&& mapper, Reducer&& r)
                     f.ignore_ready_future();
                     return std::move(rf);
                 } else {
-                    return futurize_apply(*r_ptr, std::move(f.get()));
+                    return futurize_invoke(*r_ptr, std::move(f.get0()));
                 }
             });
         });

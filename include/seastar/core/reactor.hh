@@ -81,6 +81,7 @@
 #include <seastar/core/scheduling_specific.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/internal/io_request.hh>
+#include <seastar/core/internal/io_sink.hh>
 #include <seastar/core/make_task.hh>
 #include "internal/pollable_fd.hh"
 #include "internal/poll.hh"
@@ -174,6 +175,7 @@ public:
 
 class kernel_completion;
 class io_queue;
+class io_intent;
 class disk_config_params;
 
 class io_completion : public kernel_completion {
@@ -232,6 +234,13 @@ public:
         uint64_t fstream_read_aheads_discarded = 0;
         uint64_t fstream_read_ahead_discarded_bytes = 0;
     };
+    /// Scheduling statistics.
+    struct sched_stats {
+        /// Total number of tasks processed by this shard's reactor until this point.
+        /// Note that tasks can be tiny, running for a few nanoseconds, or can take an
+        /// entire task quota.
+        uint64_t tasks_processed = 0;
+    };
     friend void io_completion::complete_with(ssize_t);
 
 private:
@@ -256,11 +265,10 @@ private:
     static constexpr unsigned max_aio = max_aio_per_queue * max_queues;
     friend disk_config_params;
 
-    // Not all reactors have IO queues. If the number of IO queues is less than the number of shards,
-    // some reactors will talk to foreign io_queues. If this reactor holds a valid IO queue, it will
-    // be stored here.
-    std::vector<std::unique_ptr<io_queue>> my_io_queues;
-    std::unordered_map<dev_t, io_queue*> _io_queues;
+    // Each mountpouint is controlled by its own io_queue, but ...
+    std::unordered_map<dev_t, std::unique_ptr<io_queue>> _io_queues;
+    // ... when dispatched all requests get into this single sink
+    internal::io_sink _io_sink;
 
     std::vector<noncopyable_function<future<> ()>> _exit_funcs;
     unsigned _id = 0;
@@ -297,7 +305,10 @@ private:
         bool _current = false;
         bool _active = false;
         uint8_t _id;
+        sched_clock::time_point _ts; // to help calculating wait/starve-times
         sched_clock::duration _runtime = {};
+        sched_clock::duration _waittime = {};
+        sched_clock::duration _starvetime = {};
         uint64_t _tasks_processed = 0;
         circular_buffer<task*> _q;
         sstring _name;
@@ -311,7 +322,6 @@ private:
         void register_stats();
     };
 
-    circular_buffer<internal::io_request> _pending_io;
     boost::container::static_vector<std::unique_ptr<task_queue>, max_scheduling_groups()> _task_queues;
     internal::scheduling_group_specific_thread_local_data _scheduling_group_specific_data;
     int64_t _last_vruntime = 0;
@@ -356,15 +366,16 @@ private:
     void wakeup();
     size_t handle_aio_error(internal::linux_abi::iocb* iocb, int ec);
     bool flush_pending_aio();
+    steady_clock_type::time_point next_pending_aio() const noexcept;
     bool reap_kernel_completions();
     bool flush_tcp_batches();
-    bool do_expire_lowres_timers();
-    bool do_check_lowres_timers() const;
-    void expire_manual_timers();
+    bool do_expire_lowres_timers() noexcept;
+    bool do_check_lowres_timers() const noexcept;
+    void expire_manual_timers() noexcept;
     void start_aio_eventfd_loop();
     void stop_aio_eventfd_loop();
     template <typename T, typename E, typename EnableFunc>
-    void complete_timers(T&, E&, EnableFunc&& enable_fn);
+    void complete_timers(T&, E&, EnableFunc&& enable_fn) noexcept(noexcept(enable_fn()));
 
     /**
      * Returns TRUE if all pollers allow blocking.
@@ -415,6 +426,7 @@ private:
     void run_some_tasks();
     void activate(task_queue& tq);
     void insert_active_task_queue(task_queue* tq);
+    task_queue* pop_active_task_queue(sched_clock::time_point now);
     void insert_activating_task_queues();
     void account_runtime(task_queue& tq, sched_clock::duration runtime);
     void account_idle(sched_clock::duration idletime);
@@ -427,7 +439,7 @@ private:
     void request_preemption();
     void start_handling_signal();
     void reset_preemption_monitor();
-    void service_highres_timer();
+    void service_highres_timer() noexcept;
 
     future<std::tuple<pollable_fd, socket_address>>
     do_accept(pollable_fd_state& listen_fd);
@@ -458,7 +470,7 @@ public:
     io_queue& get_io_queue(dev_t devid = 0) {
         auto queue = _io_queues.find(devid);
         if (queue == _io_queues.end()) {
-            return *_io_queues[0];
+            return *_io_queues.at(0);
         } else {
             return *(queue->second);
         }
@@ -517,15 +529,16 @@ public:
     // In the following three methods, prepare_io is not guaranteed to execute in the same processor
     // in which it was generated. Therefore, care must be taken to avoid the use of objects that could
     // be destroyed within or at exit of prepare_io.
-    void submit_io(io_completion* desc, internal::io_request req) noexcept;
     future<size_t> submit_io_read(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,
-            internal::io_request req) noexcept;
+            internal::io_request req,
+            io_intent* intent) noexcept;
     future<size_t> submit_io_write(io_queue* ioq,
             const io_priority_class& priority_class,
             size_t len,
-            internal::io_request req) noexcept;
+            internal::io_request req,
+            io_intent* intent) noexcept;
 
     int run();
     void exit(int ret);
@@ -562,6 +575,7 @@ public:
         }
     }
     void add_urgent_task(task* t) noexcept {
+        memory::scoped_critical_alloc_section _;
         auto sg = t->group();
         auto* q = _task_queues[sg._id].get();
         bool was_empty = q->_q.empty();
@@ -601,6 +615,12 @@ public:
     std::chrono::nanoseconds total_steal_time();
 
     const io_stats& get_io_stats() const { return _io_stats; }
+    /// Returns statistics related to scheduling. The statistics are
+    /// local to this shard.
+    ///
+    /// See \ref sched_stats for a description of individual statistics.
+    /// \return An object containing a snapshot of the statistics at this point in time.
+    sched_stats get_sched_stats() const;
     uint64_t abandoned_failed_futures() const { return _abandoned_failed_futures; }
 #ifdef HAVE_OSV
     void timer_thread_func();
@@ -623,14 +643,14 @@ private:
 
     future<> fdatasync(int fd) noexcept;
 
-    void add_timer(timer<steady_clock_type>*);
-    bool queue_timer(timer<steady_clock_type>*);
+    void add_timer(timer<steady_clock_type>*) noexcept;
+    bool queue_timer(timer<steady_clock_type>*) noexcept;
     void del_timer(timer<steady_clock_type>*) noexcept;
-    void add_timer(timer<lowres_clock>*);
-    bool queue_timer(timer<lowres_clock>*);
+    void add_timer(timer<lowres_clock>*) noexcept;
+    bool queue_timer(timer<lowres_clock>*) noexcept;
     void del_timer(timer<lowres_clock>*) noexcept;
-    void add_timer(timer<manual_clock>*);
-    bool queue_timer(timer<manual_clock>*);
+    void add_timer(timer<manual_clock>*) noexcept;
+    bool queue_timer(timer<manual_clock>*) noexcept;
     void del_timer(timer<manual_clock>*) noexcept;
 
     future<> run_exit_tasks();
@@ -683,7 +703,7 @@ public:
     future<> readable_or_writeable(pollable_fd_state& fd);
     void abort_reader(pollable_fd_state& fd);
     void abort_writer(pollable_fd_state& fd);
-    void enable_timer(steady_clock_type::time_point when);
+    void enable_timer(steady_clock_type::time_point when) noexcept;
     /// Sets the "Strict DMA" flag.
     ///
     /// When true (default), file I/O operations must use DMA.  This is
